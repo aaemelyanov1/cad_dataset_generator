@@ -1,0 +1,6 @@
+cadquery>=2.5.0
+numpy
+trimesh
+pyrender
+Pillow
+pydantic

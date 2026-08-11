@@ -1,0 +1,24 @@
+# Виртуальное окружение
+venv/
+env/
+ENV/
+.venv
+
+# Кеш компиляции
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Файлы покрытия тестов
+.coverage
+htmlcov/
+.tox/
+
+# Папки с дистрибутивами
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Папки с выводом
+output/
