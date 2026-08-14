@@ -9,15 +9,15 @@ from typing import Dict
 
 from ..syntax_tree.nodes import (
     ASTNode, PrimitiveNode, SketchNode, ExtrudeNode, RevolveNode,
-    LoftNode, SweepNode, FilletNode, ChamferNode,
-    ShellNode, HoleNode, TransformNode, PatternNode, BooleanNode,
+    TwistExtrudeNode, LoftNode, SweepNode, FilletNode, ChamferNode,
+    ShellNode, HoleNode, SplitNode, TransformNode, PatternNode, BooleanNode,
 )
 from ..operations import (
     make_box, make_cylinder, make_sphere, make_cone, make_wedge, make_torus,
-    extrude, revolve, loft, sweep,
-    fillet, chamfer, shell, hole,
+    extrude, revolve, twist_extrude, loft, sweep,
+    fillet, chamfer, shell, hole, split,
     translate, rotate, mirror,
-    rectangular_array, polar_array,
+    rectangular_array, polar_array, scatter,
     union, cut, intersect,
 )
 from ..utils.geometry_utils import unwrap_solid, fast_bbox
@@ -60,6 +60,11 @@ class Executor:
         if isinstance(node, RevolveNode):
             sk = node.children[0]
             return revolve(sk.operation, sk.parameters, node.parameters.get("angle", 360.0))
+        if isinstance(node, TwistExtrudeNode):
+            sk = node.children[0]
+            return twist_extrude(sk.operation, sk.parameters,
+                                 node.parameters["distance"],
+                                 node.parameters.get("angle", 0.0))
         if isinstance(node, LoftNode):
             profiles = [(c.operation, c.parameters) for c in node.children]
             return loft(profiles, node.parameters["offsets"])
@@ -69,18 +74,23 @@ class Executor:
             return sweep(profile.operation, profile.parameters, path.parameters)
         if isinstance(node, FilletNode):
             child = self.execute(node.children[0])
-            return fillet(child, node.parameters["radius"])
+            return fillet(child, node.parameters["radius"], node.parameters.get("selection"))
         if isinstance(node, ChamferNode):
             child = self.execute(node.children[0])
-            return chamfer(child, node.parameters["distance"])
+            return chamfer(child, node.parameters["distance"], node.parameters.get("selection"))
         if isinstance(node, ShellNode):
             child = self.execute(node.children[0])
-            return shell(child, node.parameters["thickness"],
-                        node.parameters.get("face_rank", 0))
+            return shell(child, node.parameters["thickness"], node.parameters.get("selection"))
         if isinstance(node, HoleNode):
             child = self.execute(node.children[0])
             p = node.parameters
-            return hole(child, p["position"], p["radius"], p["depth"])
+            return hole(child, p["position"], p["radius"], p["depth"],
+                        kind=p.get("kind", "through"),
+                        cbo_radius=p.get("cbo_radius"), cbo_depth=p.get("cbo_depth"),
+                        csk_radius=p.get("csk_radius"), csk_depth=p.get("csk_depth"))
+        if isinstance(node, SplitNode):
+            child = self.execute(node.children[0])
+            return split(child, node.parameters["axis"], node.parameters["gap"])
         if isinstance(node, TransformNode):
             child = self.execute(node.children[0])
             op = node.operation
@@ -99,7 +109,12 @@ class Executor:
                                         node.parameters["spacing_x"], node.parameters["spacing_y"])
             if op == "polarArray":
                 return polar_array(child, node.parameters["count"],
-                                  node.parameters.get("angle", 360.0))
+                                  node.parameters["radius"],
+                                  node.parameters.get("angle", 360.0),
+                                  node.parameters.get("start_angle", 0.0),
+                                  node.parameters.get("fill", True))
+            if op == "scatter":
+                return scatter(child, node.parameters["points"])
             raise GenerationError(f"Unknown pattern {op}")
         if isinstance(node, BooleanNode):
             left = self.execute(node.children[0])

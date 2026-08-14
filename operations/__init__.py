@@ -5,8 +5,9 @@ from .sketches import (
     make_polygon_sketch, make_slot_sketch, make_polyline_sketch, make_spline_sketch,
 )
 from .solid_ops import (
-    extrude, revolve, loft, sweep, make_path_wire, fillet, chamfer, shell, hole,
+    extrude, revolve, twist_extrude, loft, sweep, make_path_wire,
+    fillet, chamfer, shell, hole, split,
 )
 from .transforms import translate, rotate, mirror
-from .patterns import rectangular_array, polar_array
+from .patterns import rectangular_array, polar_array, scatter
 from .booleans import union, cut, intersect

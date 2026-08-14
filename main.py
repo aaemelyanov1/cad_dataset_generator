@@ -14,15 +14,23 @@ def main():
     parser.add_argument("--output", type=str, default="output", help="Папка для сохранения")
     parser.add_argument("--seed", type=int, default=42, help="Глобальный seed")
     parser.add_argument("--parallel", action="store_true", help="Параллельная генерация")
-    parser.add_argument("--programs-only", action="store_true",
-                        help="Сохранять только программы (без render/stl/step/pointcloud/mesh/ast_json)")
+    parser.add_argument("--export-formats", type=str, default="",
+                        help="Дополнительные форматы через запятую: "
+                             "step,stl,pointcloud,mesh,render,ast_json,metadata_json,program_txt "
+                             "(по умолчанию — только программы sample_NNNNN.py)")
+    parser.add_argument("--flat", action="store_true",
+                        help="Не разбивать на easy/medium/hard/expert (плоская папка)")
     args = parser.parse_args()
     config = GeneratorConfig(
         global_seed=args.seed,
         output_dir=Path(args.output)
     )
-    if args.programs_only:
-        config.save_formats = ["program_py", "program_txt"]
+    if args.export_formats:
+        for fmt in (f.strip() for f in args.export_formats.split(",") if f.strip()):
+            if fmt not in config.save_formats:
+                config.save_formats.append(fmt)
+    if args.flat:
+        config.split_by_complexity = False
     builder = DatasetBuilder(config)
     builder.generate_dataset(args.num_samples, parallel=args.parallel)
 

@@ -9,13 +9,15 @@ class ShapeState(str, Enum):
 _TRANSITIONS: Dict[ShapeState, List[str]] = {
     ShapeState.EMPTY: [
         "box", "cylinder", "sphere", "cone", "wedge", "torus",
-        "rect", "circle", "ellipse", "polygon", "slot", "polyline", "spline"
+        "rect", "circle", "ellipse", "polygon", "slot", "polyline", "spline",
+        "roundrect", "frame", "sector", "arc_profile", "ellipse_arc",
+        "bent", "mirrored"
     ],
-    ShapeState.SKETCH: ["extrude", "revolve", "loft", "sweep"],
+    ShapeState.SKETCH: ["extrude", "revolve", "twist_extrude", "loft", "sweep"],
     ShapeState.SOLID: [
-        "fillet", "chamfer", "shell", "hole",
+        "fillet", "chamfer", "shell", "hole", "split",
         "translate", "rotate", "mirror",
-        "rarray", "polarArray",
+        "rarray", "polarArray", "scatter",
         "union", "cut", "intersect"
     ]
 }

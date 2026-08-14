@@ -1,7 +1,9 @@
 import json
 import traceback
+import multiprocessing as mp
+import os
+import time
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 from ..config import GeneratorConfig
 from ..builder.ast_builder import ASTBuilder
@@ -25,22 +27,48 @@ class DatasetBuilder:
         self.executor = Executor()
         self.validator = GeometryValidator(config)
 
+    @property
+    def _programs_only(self) -> bool:
+        """Режим «только программы»: в save_formats нет ни одного геометрического
+        экспорта, значит на сэмпл пишется ровно один (или два) текстовых файла."""
+        return set(self.config.save_formats) <= {"program_py", "program_txt"}
+
+    def _sample_base_dir(self, complexity: str) -> Path:
+        base = self.config.output_dir
+        if self.config.split_by_complexity:
+            base = base / complexity
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
     def generate_sample(self, index: int, seed: int) -> bool:
-        sample_dir = self.config.output_dir / f"sample_{index:05d}"
         self.executor.clear()
         try:
-            sample_dir.mkdir(parents=True, exist_ok=True)
             complexity = self.config.complexity_levels[index % len(self.config.complexity_levels)]
             builder = ASTBuilder(self.config, seed=seed, complexity=complexity)
             ast = builder.build()
             shape = self.executor.execute(ast)
+            self.validator.validate(shape, is_root=True)
+            base_dir = self._sample_base_dir(complexity)
+            if self._programs_only:
+                # режим по умолчанию: только исполняемые программы, разбитые
+                # по папкам easy/medium/hard/expert — без подпапок и экспортов
+                code = generate_code(ast)
+                sample_file = base_dir / f"sample_{index:05d}.py"
+                sample_file.write_text(code, encoding="utf-8")
+                if "program_txt" in self.config.save_formats:
+                    (base_dir / f"sample_{index:05d}.txt").write_text(code, encoding="utf-8")
+                logger.info(f"Sample {index} generated successfully.")
+                return True
+            sample_dir = base_dir / f"sample_{index:05d}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
             # метаданные считаем ДО validate/export: BRepMesh_IncrementalMesh
             # (в fast_bbox и tessellate) мутирует shape, после чего BoundingBox()
             # возвращает другие значения
             metadata = Metadata.from_ast(ast, complexity, seed, self.config, shape=shape)
-            self.validator.validate(shape, is_root=True)
             self._export(ast, shape, sample_dir)
             self._save_program(ast, sample_dir)
+            # metadata.json/ast.json пишутся всегда в полном режиме: они дёшевы
+            # и описывают сэмпл (сложность, seed, состав операций)
             with open(sample_dir / "metadata.json", "w") as f:
                 f.write(metadata.model_dump_json(indent=2))
             logger.info(f"Sample {index} generated successfully.")
@@ -48,7 +76,9 @@ class DatasetBuilder:
         except Exception as e:
             logger.error(f"Failed to generate sample {index}: {e}")
             traceback.print_exc()
-            if sample_dir.exists():
+            complexity = self.config.complexity_levels[index % len(self.config.complexity_levels)]
+            sample_dir = self._sample_base_dir(complexity) / f"sample_{index:05d}"
+            if not self._programs_only and sample_dir.exists():
                 import shutil
                 shutil.rmtree(sample_dir)
             return False
@@ -65,9 +95,11 @@ class DatasetBuilder:
             MeshExporter.export(shape, sample_dir / "mesh.obj")
         if "render" in formats:
             RenderExporter.export(shape, sample_dir / "render.png", self.config.render_resolution)
-        if "ast_json" in formats:
-            with open(sample_dir / "ast.json", "w") as f:
-                f.write(ast.to_json())
+        # ast.json пишется всегда в полном режиме (как и metadata.json): он нужен
+        # для обучения/воспроизведения и дёшев; формат-элемент оставлен для явной
+        # совместимости с флагом --export-formats
+        with open(sample_dir / "ast.json", "w") as f:
+            f.write(ast.to_json())
 
     def _save_program(self, ast: ASTNode, sample_dir: Path):
         code = generate_code(ast)
@@ -79,40 +111,112 @@ class DatasetBuilder:
                 f.write(code)
 
     def generate_dataset(self, num_samples: int, parallel: bool = True):
+        """Генерирует датасет, защищая каждый сэмпл жёстким таймаутом.
+
+        OCCT-операции (булевы, массивы) могут недетерминированно зависать на
+        отдельных семплях. Каждый сэмпл выполняется в отдельном воркере
+        multiprocessing.Pool; если сэмпл не завершился за sample_timeout секунд,
+        пул принудительно завершается и сэмпл перезапускается со следующим seed.
+        Зависшие сэмплы изолированы: независшим воркерам даётся grace-интервал
+        закончить работу до terminate(), и каждый перезапуск тратит retry
+        (цикл гарантированно сходится). Внутри билдера сборка ограничена
+        wall-clock лимитом, поэтому превышение sample_timeout означает зависшую
+        OCCT-операцию. Ни один «плохой» seed не может заблокировать генерацию.
+        """
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
         base_seeds = np.random.SeedSequence(self.config.global_seed).generate_state(num_samples)
+        workers = 1
         if parallel:
-            self._generate_parallel(num_samples, base_seeds)
-        else:
-            for i in range(num_samples):
-                base = int(base_seeds[i])
-                for retry in range(self.config.max_seed_retries):
-                    if self.generate_sample(i, base + retry):
-                        break
-                else:
-                    logger.error(
-                        f"Sample {i} failed after {self.config.max_seed_retries} seed retries")
-
-    def _generate_parallel(self, num_samples: int, base_seeds) -> None:
+            # 8 параллельных OCCT-процессов достаточно, чтобы насытить CPU;
+            # массовый spawn десятков процессов на Windows может сбоить (WinError 87)
+            workers = max(1, min(os.cpu_count() or 1, 8, num_samples))
+        timeout = float(self.config.sample_timeout)
         retries_left = {i: self.config.max_seed_retries for i in range(num_samples)}
-        attempts: dict = {}
-        with ProcessPoolExecutor() as pool:
-            for i in range(num_samples):
-                seed = int(base_seeds[i])
-                attempts[pool.submit(self.generate_sample, i, seed)] = (i, seed)
-            while attempts:
-                for future in as_completed(attempts):
-                    i, seed = attempts.pop(future)
-                    ok = False
-                    try:
-                        ok = bool(future.result())
-                    except Exception as exc:
-                        logger.error(f"Sample {i} (seed {seed}) raised an exception: {exc}")
-                    if not ok:
-                        retries_left[i] -= 1
-                        if retries_left[i] > 0:
-                            attempts[pool.submit(self.generate_sample, i, seed + 1)] = (i, seed + 1)
-                        else:
-                            logger.error(
-                                f"Sample {i} failed after {self.config.max_seed_retries} seed retries")
+        pending: dict = {i: int(base_seeds[i]) for i in range(num_samples)}
+
+        while pending:
+            pool = None
+            for _ in range(3):
+                try:
+                    pool = mp.Pool(processes=min(workers, len(pending)))
                     break
+                except OSError:
+                    time.sleep(1.0)
+            if pool is None:
+                raise RuntimeError("failed to create multiprocessing pool")
+            futures = {i: pool.apply_async(self.generate_sample, (i, seed))
+                       for i, seed in pending.items()}
+            pool.close()
+
+            next_pending: dict = {}
+            settled = set()
+            hung = None
+
+            def settle(idx: int, ok: bool):
+                """Учитывает результат сэмпла: удаляет либо отправляет на retry."""
+                retries_left[idx] -= 1
+                if ok:
+                    return
+                if retries_left[idx] <= 0:
+                    logger.error(f"Sample {idx} failed after "
+                                 f"{self.config.max_seed_retries} seed retries")
+                else:
+                    prev = pending[idx]
+                    next_pending[idx] = prev + 1
+
+            for i in list(futures):
+                if hung is not None:
+                    break
+                try:
+                    ok = bool(futures[i].get(timeout=timeout))
+                except mp.TimeoutError:
+                    hung = i
+                    break
+                except Exception as exc:
+                    logger.error(f"Sample {i} raised an exception: {exc}")
+                    ok = False
+                settled.add(i)
+                settle(i, ok)
+
+            if hung is not None:
+                logger.error(f"Sample {hung} timed out after {timeout}s "
+                             f"(OCCT op hung) — restarting with next seed")
+                # доводим независших товарищей: пока они ещё выполнялись, даём
+                # им ещё один интервал (grace) закончиться, чтобы terminate()
+                # не выбрасывал их готовую работу
+                grace_deadline = time.monotonic() + timeout
+                for j in list(futures):
+                    if j == hung or j in settled:
+                        continue
+                    rem = grace_deadline - time.monotonic()
+                    if rem <= 0:
+                        break
+                    try:
+                        ok = bool(futures[j].get(timeout=rem))
+                    except mp.TimeoutError:
+                        continue
+                    except Exception as exc:
+                        logger.error(f"Sample {j} raised an exception: {exc}")
+                        ok = False
+                    settled.add(j)
+                    settle(j, ok)
+                retries_left[hung] -= 1
+                if retries_left[hung] > 0:
+                    next_pending[hung] = pending[hung] + 1
+            # сэмплы, чья работа оборвана terminate() до завершения, запускаем
+            # заново с тем же seed; такой перезапуск тоже тратит retry, чтобы
+            # цикл всегда сходился (нельзя вечно перезапускать «медленных»)
+            for j in list(futures):
+                if j in settled:
+                    continue
+                retries_left[j] -= 1
+                if retries_left[j] > 0:
+                    next_pending.setdefault(j, pending[j])
+                else:
+                    logger.error(f"Sample {j} repeatedly killed by timeouts after "
+                                 f"{self.config.max_seed_retries} attempts")
+
+            pool.terminate()
+            pool.join()
+            pending = next_pending
+        logger.info("Dataset generation finished.")

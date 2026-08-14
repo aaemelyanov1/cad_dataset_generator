@@ -47,11 +47,16 @@ class ASTNode(ABC):
             "rect": SketchNode, "circle": SketchNode, "ellipse": SketchNode,
             "polygon": SketchNode, "slot": SketchNode, "polyline": SketchNode,
             "spline": SketchNode,
+            "roundrect": SketchNode, "frame": SketchNode, "sector": SketchNode,
+            "arc_profile": SketchNode, "ellipse_arc": SketchNode,
+            "bent": SketchNode, "mirrored": SketchNode,
             "extrude": ExtrudeNode, "revolve": RevolveNode,
+            "twist_extrude": TwistExtrudeNode,
             "loft": LoftNode, "sweep": SweepNode,
             "path": PathNode,
             "fillet": FilletNode, "chamfer": ChamferNode,
             "shell": ShellNode, "hole": HoleNode,
+            "split": SplitNode,
             "translate": TransformNode, "rotate": TransformNode, "mirror": TransformNode,
             "rarray": PatternNode, "polarArray": PatternNode,
             "union": BooleanNode, "cut": BooleanNode, "intersect": BooleanNode
@@ -144,6 +149,24 @@ class RevolveNode(ASTNode):
         return cls(node_id=d["node_id"], operation=d["operation"],
                    parameters=d["parameters"], children=[child],
                    shape_state=d["shape_state"], metadata=d.get("metadata", {}))
+
+@dataclass
+class TwistExtrudeNode(ASTNode):
+    def __post_init__(self):
+        self.shape_state = "SOLID"
+        if len(self.children) != 1 or not isinstance(self.children[0], SketchNode):
+            raise ValueError("TwistExtrude requires one SketchNode child")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return super().to_dict()
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> TwistExtrudeNode:
+        child = ASTNode._node_from_dict(d["children"][0])
+        return cls(node_id=d["node_id"], operation=d["operation"],
+                   parameters=d["parameters"], children=[child],
+                   shape_state=d["shape_state"], metadata=d.get("metadata", {}))
+
 
 @dataclass
 class LoftNode(ASTNode):
@@ -248,6 +271,22 @@ class HoleNode(ASTNode):
         return super().to_dict()
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> HoleNode:
+        child = ASTNode._node_from_dict(d["children"][0])
+        return cls(node_id=d["node_id"], operation=d["operation"],
+                   parameters=d["parameters"], children=[child],
+                   shape_state=d["shape_state"], metadata=d.get("metadata", {}))
+
+
+@dataclass
+class SplitNode(ASTNode):
+    def __post_init__(self):
+        self.shape_state = "SOLID"
+        if len(self.children) != 1:
+            raise ValueError("Split requires one solid child")
+    def to_dict(self) -> Dict[str, Any]:
+        return super().to_dict()
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> SplitNode:
         child = ASTNode._node_from_dict(d["children"][0])
         return cls(node_id=d["node_id"], operation=d["operation"],
                    parameters=d["parameters"], children=[child],
