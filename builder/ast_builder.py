@@ -249,16 +249,18 @@ class ASTBuilder:
     def _should_try_unary(self, op: str, child: ASTNode) -> bool:
         """Вероятностный фильтр дорогих/рискованных модификаторов.
 
-        Transform-операции гарантированно работают и почти бесплатны — всегда
-        пробуем. fillet/chamfer теперь выводят радиус из длины рёбер и почти
-        всегда успешны, hole ~0.1с, массивы — серии fuse-операций, а shell стоит
+        Transform-операции гарантированно работают и почти бесплатны, но при
+        вероятности 1.0 встречались чаще остальных модификаторов — теперь их
+        частота ограничена config.modifier_probabilities (translate/rotate/mirror
+        0.3). fillet/chamfer выводят радиус из длины рёбер и почти всегда
+        успешны, hole ~0.1с, массивы — серии fuse-операций, а shell стоит
         несколько секунд на вызов OCCT. Дорогие операции пробуем реже, чтобы не
         тратить время на неудачные попытки и держать среднее время генерации
         низким. Вероятности настраиваются через config.modifier_probabilities.
         """
         probs = self.config.modifier_probabilities
         if op in ("translate", "rotate", "mirror"):
-            return True
+            return self.rng.random() < probs.get(op, 1.0)
         if op == "shell":
             # shell крайне дорог (секунды на вызов) и обычно работает только
             # на «простых» телах (без булевых/массивов внутри)
@@ -395,6 +397,10 @@ class ASTBuilder:
         for op in order:
             if added >= max_ops:
                 break
+            if op in ("translate", "rotate", "mirror") and not self._should_try_unary(op, node):
+                # трансформации фильтруются той же вероятностью (0.3), что и в
+                # основном билдере — фичи не должны тащить их чаще остальных
+                continue
             saved = self._save_state()
             try:
                 node = self._create_unary(op, node)

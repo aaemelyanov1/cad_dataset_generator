@@ -116,7 +116,8 @@ class DatasetBuilder:
             with open(sample_dir / "program.txt", "w") as f:
                 f.write(code)
 
-    def generate_dataset(self, num_samples: int, parallel: bool = True):
+    def generate_dataset(self, num_samples: int, parallel: bool = True,
+                         start_sample: int = 0):
         """Генерирует датасет, защищая каждый сэмпл жёстким таймаутом.
 
         OCCT-операции (булевы, массивы) могут недетерминированно зависать на
@@ -128,16 +129,36 @@ class DatasetBuilder:
         (цикл гарантированно сходится). Внутри билдера сборка ограничена
         wall-clock лимитом, поэтому превышение sample_timeout означает зависшую
         OCCT-операцию. Ни один «плохой» seed не может заблокировать генерацию.
+
+        `start_sample` — индекс первого сэмпла (по умолчанию 0): с него начинается
+        генерация. Семена считаются по абсолютному диапазону
+        `SeedSequence(global_seed).generate_state(start_sample + num_samples)` и
+        берётся срез `[start_sample : start_sample + num_samples]`, поэтому
+        `seed(i) = states[i]` не зависит от размера чанка: прогон 30 сэмплов за
+        раз и два прогона по 15 (0..14 + 15..29) при том же `--seed` дают
+        идентичные программы. Работает во всех режимах вывода (только программы,
+        плоский `--flat`, полный с экспортами): сложность, имена файлов
+        `sample_{index:05d}*` и таймауты привязаны к абсолютному индексу.
         """
+        if num_samples <= 0:
+            logger.warning("num_samples=%d: nothing to generate", num_samples)
+            return
+        if start_sample < 0:
+            raise ValueError(f"start_sample must be >= 0, got {start_sample}")
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        base_seeds = np.random.SeedSequence(self.config.global_seed).generate_state(num_samples)
+        total = start_sample + num_samples
+        base_seeds = np.random.SeedSequence(self.config.global_seed).generate_state(total)
+        indices = list(range(start_sample, total))
         workers = 1
         if parallel:
             # 8 параллельных OCCT-процессов достаточно, чтобы насытить CPU;
             # массовый spawn десятков процессов на Windows может сбоить (WinError 87)
             workers = max(1, min(os.cpu_count() or 1, 8, num_samples))
-        retries_left = {i: self.config.max_seed_retries for i in range(num_samples)}
-        pending: dict = {i: int(base_seeds[i]) for i in range(num_samples)}
+        retries_left = {i: self.config.max_seed_retries for i in indices}
+        pending: dict = {i: int(base_seeds[i]) for i in indices}
+        logger.info("Generating %d samples starting from index %d "
+                    "(global seed %d)", num_samples, start_sample,
+                    self.config.global_seed)
 
         while pending:
             pool = None
