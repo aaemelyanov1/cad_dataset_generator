@@ -4,10 +4,10 @@ import pytest
 
 from cad_dataset_generator.operations import (
     make_box, make_cylinder, make_sphere, make_cone, make_wedge, make_torus,
-    extrude, revolve, loft, sweep,
-    fillet, chamfer, shell, hole,
+    extrude, revolve, twist_extrude, loft, sweep,
+    fillet, chamfer, shell, hole, split,
     translate, rotate, mirror,
-    rectangular_array, polar_array,
+    rectangular_array, polar_array, scatter,
     union, cut, intersect,
 )
 from cad_dataset_generator.utils.geometry_utils import unwrap_solid
@@ -34,6 +34,36 @@ def test_extrude_revolve():
     assert _volume(extrude("rect", rect, 4.0)) > 0
     circle = {"workplane": "XY", "center": (5.0, 0.0), "radius": 1.0}
     assert _volume(revolve("circle", circle, 360.0)) > 0
+
+
+def test_twist_extrude():
+    rect = {"workplane": "XY", "center": (0.0, 0.0), "width": 3.0, "height": 3.0}
+    t = twist_extrude("rect", rect, 4.0, 30.0)
+    solid = unwrap_solid(t)
+    assert _volume(solid) > 0
+    assert len(list(solid.Solids())) == 1
+
+
+def test_split_reduces_volume():
+    base = make_box(6, 4, 3)
+    base_vol = _volume(base)
+    s = unwrap_solid(split(base, "Z", 0.9))
+    assert len(list(s.Solids())) == 1
+    assert 0 < _volume(s) < base_vol
+
+
+@pytest.mark.parametrize("kind,pos,depth,extra", [
+    ("through", (0.0, 0.0, -1.0), 8.0, {}),
+    ("blind", (0.0, 0.0, 3.0), 2.0, {}),
+    ("cbore", (0.0, 0.0, 3.0), 2.0, {"cbo_radius": 1.5, "cbo_depth": 1.2}),
+    ("csk", (0.0, 0.0, 3.0), 2.0, {"csk_radius": 1.8, "csk_depth": 1.0}),
+])
+def test_hole_kinds_reduce_volume(kind, pos, depth, extra):
+    base = make_box(6, 6, 6)
+    base_vol = _volume(base)
+    h = unwrap_solid(hole(base, pos, 0.7, depth, kind=kind, **extra))
+    assert len(list(h.Solids())) == 1
+    assert 0 < _volume(h) < base_vol
 
 
 @pytest.mark.parametrize("op", ["polyline", "spline"])
@@ -73,7 +103,7 @@ def test_fillet_chamfer_reduce_volume():
 
 def test_shell_reduces_volume():
     base = make_box(4, 4, 4)
-    s = shell(base, 0.2, face_rank=0)
+    s = shell(base, 0.2, {"kind": "direction", "direction": (0.0, 0.0, 1.0)})
     assert 0 < _volume(s) < _volume(base)
 
 
@@ -93,7 +123,12 @@ def test_transforms_preserve_volume():
 
 def test_patterns_single_solid():
     base = make_box(2, 2, 2)
-    for shape in [rectangular_array(base, 3, 2, 1.2, 1.2), polar_array(base, 5)]:
+    shapes = [
+        rectangular_array(base, 3, 2, 1.2, 1.2),
+        polar_array(base, 5, radius=0.8),
+        scatter(base, [(0.0, 0.0), (0.8, 0.0), (0.0, 0.8)]),
+    ]
+    for shape in shapes:
         solid = unwrap_solid(shape)
         assert len(list(solid.Solids())) == 1
         assert _volume(solid) > 0

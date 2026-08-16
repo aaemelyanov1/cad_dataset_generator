@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from pathlib import Path
 
 @dataclass
@@ -15,6 +15,8 @@ class GeneratorConfig:
     max_booleans: int = 10
     max_patterns: int = 5
     max_shell: int = 1
+    max_splits: int = 5
+    max_twist_extrudes: int = 10
     max_depth: int = 14
     max_operations: int = 40
     binary_probability: float = 0.4
@@ -26,10 +28,54 @@ class GeneratorConfig:
     shell_thickness_ratio: float = 0.02
     backtrack_attempts: int = 60
     max_seed_retries: int = 50
-    save_formats: List[str] = field(default_factory=lambda: [
-        "step", "stl", "pointcloud", "mesh", "program_py", "program_txt",
-        "ast_json", "metadata_json", "render"
-    ])
+    sample_timeout: float = 150.0
+    # --- вероятности «попробовать» дорогих/рискованных модификаторов ---
+    modifier_probabilities: Dict[str, float] = field(default_factory=lambda: {
+        "shell": 0.3,
+        "fillet": 0.6,
+        "chamfer": 0.6,
+        "rarray": 0.6,
+        "polarArray": 0.6,
+        "scatter": 0.6,
+        "hole": 0.5,
+        "split": 0.6,
+    })
+    # --- веса выбора унарных модификаторов (влияют на разнообразие) ---
+    unary_choice_weights: Dict[str, float] = field(default_factory=lambda: {
+        "fillet": 5.0,
+        "chamfer": 5.0,
+        "shell": 3.5,
+        "hole": 5.0,
+        "split": 3.5,
+        "translate": 2.5,
+        "rotate": 2.5,
+        "mirror": 2.5,
+        "rarray": 3.0,
+        "polarArray": 3.0,
+        "scatter": 3.0,
+    })
+    # --- веса выбора бинарных операций ---
+    binary_choice_weights: Dict[str, float] = field(default_factory=lambda: {
+        "union": 5.0,
+        "cut": 5.0,
+        "intersect": 2.0,
+    })
+    # --- веса выбора листовых (терминальных) операций ---
+    leaf_choice_weights: Dict[str, float] = field(default_factory=lambda: {
+        "box": 1.0,
+        "cylinder": 1.0,
+        "sphere": 1.0,
+        "cone": 1.0,
+        "wedge": 1.0,
+        "torus": 1.0,
+        "extrude": 1.2,
+        "revolve": 1.2,
+        "twist_extrude": 1.2,
+        "loft": 2.5,
+        "sweep": 2.5,
+    })
+    split_by_complexity: bool = True
+    save_formats: List[str] = field(default_factory=lambda: ["program_py"])
     pointcloud_samples: int = 4096
     render_resolution: Tuple[int, int] = (512, 512)
     global_seed: int = 42
