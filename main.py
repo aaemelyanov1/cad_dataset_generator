@@ -13,6 +13,11 @@ def main():
     parser.add_argument("--num_samples", type=int, default=100, help="Количество моделей")
     parser.add_argument("--output", type=str, default="output", help="Папка для сохранения")
     parser.add_argument("--seed", type=int, default=42, help="Глобальный seed")
+    parser.add_argument("--start-sample", type=int, default=0,
+                        help="Индекс первого сэмпла (возобновление прерванной "
+                             "генерации; по умолчанию 0). Тот же --seed и "
+                             "--num_samples дают те же программы для индексов, "
+                             "поэтому прогон 30 сэмплов == два прогона по 15.")
     parser.add_argument("--parallel", action="store_true", help="Параллельная генерация")
     parser.add_argument("--export-formats", type=str, default="",
                         help="Дополнительные форматы через запятую: "
@@ -32,7 +37,8 @@ def main():
     if args.flat:
         config.split_by_complexity = False
     builder = DatasetBuilder(config)
-    builder.generate_dataset(args.num_samples, parallel=args.parallel)
+    builder.generate_dataset(args.num_samples, parallel=args.parallel,
+                             start_sample=args.start_sample)
 
 if __name__ == "__main__":
     main()

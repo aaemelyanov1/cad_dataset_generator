@@ -46,3 +46,56 @@ def test_program_txt_only_still_single_file_mode(tmp_path):
     builder.generate_dataset(1, parallel=False)
     assert (tmp_path / "easy" / "sample_00000.py").exists()
     assert (tmp_path / "easy" / "sample_00000.txt").exists()
+
+
+def test_start_sample_chunk_determinism(tmp_path):
+    """Прогон 6 сэмплов одним заходом == два прогона по 3 (0..2 + 3..5):
+    тот же --seed и абсолютные индексы дают идентичные программы."""
+    cfg = dict(complexity_levels=["easy"], split_by_complexity=False)
+    a = tmp_path / "one_go"
+    b = tmp_path / "two_goes"
+    builder_a = DatasetBuilder(GeneratorConfig(output_dir=a, **cfg))
+    builder_a.generate_dataset(6, parallel=False)
+
+    builder_b = DatasetBuilder(GeneratorConfig(output_dir=b, **cfg))
+    builder_b.generate_dataset(3, parallel=False, start_sample=0)
+    builder_b.generate_dataset(3, parallel=False, start_sample=3)
+
+    for i in range(6):
+        fa = a / f"sample_{i:05d}.py"
+        fb = b / f"sample_{i:05d}.py"
+        assert fa.exists(), f"missing {fa}"
+        assert fb.exists(), f"missing {fb}"
+        assert fa.read_text(encoding="utf-8") == fb.read_text(encoding="utf-8"), \
+            f"sample {i} differs between one-go and chunked runs"
+
+
+def test_start_sample_full_mode_resume(tmp_path):
+    """Возобновление в полном режиме: start_sample=2 пишет только сэмплы 2..3."""
+    config = GeneratorConfig(output_dir=tmp_path,
+                             complexity_levels=["easy"],
+                             save_formats=["program_py", "step", "stl"])
+    builder = DatasetBuilder(config)
+    builder.generate_dataset(2, parallel=False, start_sample=2)
+    for i in (2, 3):
+        d = tmp_path / "easy" / f"sample_{i:05d}"
+        assert (d / "program.py").exists()
+        assert (d / "metadata.json").exists()
+        assert (d / "ast.json").exists()
+        assert (d / "model.step").exists()
+        assert (d / "model.stl").exists()
+    assert not (tmp_path / "easy" / "sample_00000").exists()
+    assert not (tmp_path / "easy" / "sample_00001").exists()
+
+
+def test_start_sample_flat_resume_continues(tmp_path):
+    """Плоский режим: два прогона по 2 (0..1 и 2..3) дополняют одну папку."""
+    config = GeneratorConfig(output_dir=tmp_path,
+                             complexity_levels=["easy"],
+                             split_by_complexity=False)
+    builder = DatasetBuilder(config)
+    builder.generate_dataset(2, parallel=False, start_sample=0)
+    builder.generate_dataset(2, parallel=False, start_sample=2)
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["sample_00000.py", "sample_00001.py",
+                     "sample_00002.py", "sample_00003.py"]

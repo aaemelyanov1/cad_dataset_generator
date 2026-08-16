@@ -47,6 +47,9 @@ class GeneratorConfig:
         "scatter": 0.6,
         "hole": 0.5,
         "split": 0.6,
+        "translate": 0.3,
+        "rotate": 0.3,
+        "mirror": 0.3,
     })
     # --- веса выбора унарных модификаторов (влияют на разнообразие) ---
     unary_choice_weights: Dict[str, float] = field(default_factory=lambda: {
@@ -69,6 +72,9 @@ class GeneratorConfig:
         "intersect": 2.0,
     })
     # --- веса выбора листовых (терминальных) операций ---
+    # порядок по убыванию вероятности: extrude/revolve (1.5) > twist/loft/sweep
+    # (1.2) > примитивы (1.0). loft/sweep дополнительно отсекаются «рисковым»
+    # пулом _build_leaf_solid, поэтому на деле ещё реже.
     leaf_choice_weights: Dict[str, float] = field(default_factory=lambda: {
         "box": 1.0,
         "cylinder": 1.0,
@@ -76,11 +82,11 @@ class GeneratorConfig:
         "cone": 1.0,
         "wedge": 1.0,
         "torus": 1.0,
-        "extrude": 1.2,
-        "revolve": 1.2,
+        "extrude": 1.5,
+        "revolve": 1.5,
         "twist_extrude": 1.2,
-        "loft": 2.5,
-        "sweep": 2.5,
+        "loft": 1.2,
+        "sweep": 1.2,
     })
     split_by_complexity: bool = True
     save_formats: List[str] = field(default_factory=lambda: ["program_py"])
