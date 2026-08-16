@@ -29,6 +29,14 @@ class GeneratorConfig:
     backtrack_attempts: int = 60
     max_seed_retries: int = 50
     sample_timeout: float = 150.0
+    # таймаут зависшего сэмпла по сложности: лёгкие уровни живут ~attempt_timeout*4
+    # (easy 32s, medium 60s, hard 80s, expert 120s), ждать 150s на easy бессмысленно
+    sample_timeouts: Dict[str, float] = field(default_factory=lambda: {
+        "easy": 40.0,
+        "medium": 75.0,
+        "hard": 100.0,
+        "expert": 150.0,
+    })
     # --- вероятности «попробовать» дорогих/рискованных модификаторов ---
     modifier_probabilities: Dict[str, float] = field(default_factory=lambda: {
         "shell": 0.3,

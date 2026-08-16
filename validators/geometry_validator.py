@@ -25,7 +25,14 @@ class GeometryValidator:
         self.config = config
 
     def validate(self, shape: cq.Shape, is_root: bool = False):
-        """Бросает ValidationError, если геометрия невалидна. Возвращает исправленный shape."""
+        """Бросает ValidationError, если геометрия невалидна. Возвращает исправленный shape.
+
+        Внутренние узлы валидируются «легко» (unwrap + единый Solid + объём):
+        глобальные габаритные лимиты и BRepCheck/ShapeFix выполняются только для
+        root. Это убирает дорогой bbox по сетке с каждого отброшенного кандидата
+        (внутренний узел не обязан быть «финальным» по размеру — он всё равно
+        пройдёт полную проверку, когда станет частью root).
+        """
         if shape is None:
             raise ValidationError("Shape is None")
         wrapped = getattr(shape, "wrapped", None)
@@ -54,17 +61,18 @@ class GeometryValidator:
         if volume > self.config.max_volume:
             raise ValidationError(f"Volume too large: {volume}")
 
-        xmin, xmax, ymin, ymax, zmin, zmax = fast_bbox(shape)
-        xlen = xmax - xmin
-        ylen = ymax - ymin
-        zlen = zmax - zmin
-        diag = np.sqrt(xlen ** 2 + ylen ** 2 + zlen ** 2)
-        if not np.isfinite(diag):
-            raise ValidationError(f"Bounding box diagonal is NaN/Inf: {diag}")
-        if diag < self.config.min_bbox_diag:
-            raise ValidationError(f"Bounding box diagonal too small: {diag}")
-        if diag > self.config.max_bbox_diag:
-            raise ValidationError(f"Bounding box diagonal too large: {diag}")
+        if is_root:
+            xmin, xmax, ymin, ymax, zmin, zmax = fast_bbox(shape)
+            xlen = xmax - xmin
+            ylen = ymax - ymin
+            zlen = zmax - zmin
+            diag = np.sqrt(xlen ** 2 + ylen ** 2 + zlen ** 2)
+            if not np.isfinite(diag):
+                raise ValidationError(f"Bounding box diagonal is NaN/Inf: {diag}")
+            if diag < self.config.min_bbox_diag:
+                raise ValidationError(f"Bounding box diagonal too small: {diag}")
+            if diag > self.config.max_bbox_diag:
+                raise ValidationError(f"Bounding box diagonal too large: {diag}")
 
         return shape
 

@@ -125,7 +125,7 @@ class ASTBuilder:
                     return node
             except TimeoutError:
                 deadline_hits += 1
-                if deadline_hits >= 10:
+                if deadline_hits >= 3:
                     raise GenerationError(
                         f"Failed to build a {self.complexity} model: repeated timeouts "
                         f"for seed {self.base_seed}")
@@ -297,38 +297,55 @@ class ASTBuilder:
 
         Булевы операции над двумя «сложными» операндами (union/pattern/fillet/
         shell внутри обоих поддеревьев) — главный источник недетерминированных
-        зависаний OCCT: BRepAlgoAPI_* может не завершиться вовсе. Чтобы не
-        строить и не выбрасывать дорогие поддеревья, первым строится «большой»
-        операнд; если он оказался сложным, второй строится как дешёвый лист —
-        так один операнд всегда простой, гейт не срабатывает, и лишняя работа
-        не тратится. intersect оставляем только для двух простых листов.
+        зависаний OCCT: BRepAlgoAPI_* может не завершиться вовсе. Поэтому сначала
+        строится ТОЛЬКО первый («большой») операнд, а второй выбирается уже по его
+        фактической сложности — так ни одно дорогое поддерево не строится впустую:
+          * первый простой и маленький — второй забирает остаток бюджета
+            (сохраняются сбалансированные булевы из двух средних операндов);
+          * первый сложный/большой — второй дешёвая «фича»
+            (`_build_simple_feature`: лист ± трансформации, гарантированно
+            простая), поэтому гейт «хотя бы один простой» не срабатывает и работа
+            не выбрасывается. intersect оставляем только для двух простых листов.
         """
         if time.time() > self._deadline:
             raise TimeoutError("attempt time budget exceeded")
         child_budget = budget - 1
-        # Режим A — сбалансированные операнды (разнообразие), режим B — «основное
-        # тело + маленькая фича»: первый операнд забирает почти весь бюджет,
-        # второй — дешёвый лист, поэтому булева операция всегда разрешена и
-        # дорогие поддеревья не строятся впустую.
-        balanced = self.rng.random() < 0.5
-        if not balanced:
-            first = self._build_solid(depth + 1, child_budget - 1)
-            second = self._build_leaf_solid(depth + 1, 1)
+        # Половина попыток — «основное тело + маленькая фича» (первый операнд
+        # забирает почти весь бюджет), половина — сбалансированные операнды.
+        # В обоих случаях второй операнд строится уже ПОСЛЕ того, как первый
+        # реально построен и известно его фактическое число операций и сложность:
+        #  * первый простой и занял не больше половины бюджета — второй получает
+        #    остаток бюджета (сохраняются сбалансированные булевы);
+        #  * первый сложный/большой — второй дешёвая «фича»
+        #    (`_build_simple_feature`: лист ± трансформации, гарантированно
+        #    простая), поэтому гейт «хотя бы один простой» не срабатывает и
+        #    дорогие поддеревья не строятся впустую.
+        if self.rng.random() < 0.5:
+            first_budget = child_budget - 1
         else:
             lo = max(1, child_budget // 3)
             hi = max(lo, child_budget // 2)
             first_budget = int(self.rng.integers(lo, hi + 1))
-            first = self._build_solid(depth + 1, first_budget)
-            second = self._build_solid(depth + 1, child_budget - first_budget)
+        first = self._build_solid(depth + 1, first_budget)
+        first_n = first.count_operations()
+        if self._is_simple_shape(first) and first_n <= max(1, child_budget // 2):
+            second = self._build_solid(depth + 1, max(1, child_budget - first_n))
+        else:
+            saved_second = self._save_state()
+            try:
+                second = self._build_simple_feature(depth + 1)
+            except (GenerationError, ValidationError):
+                self._restore_state(saved_second)
+                return None
         if self.rng.random() < 0.5:
             left, right = first, second
         else:
             left, right = second, first
         left_simple = self._is_simple_shape(left)
         right_simple = self._is_simple_shape(right)
-        # Если оба операнда сложные (только в режиме A) — булева операция
-        # слишком рискованна (недетерминированные зависания OCCT); не строим
-        # её, а откатываемся к унарным модификаторам.
+        # оба операнда сложными быть не могут по построению (при сложном первом
+        # второй — гарантированно «простая» фича); гейт оставлен как страховка от
+        # патологических комбинаций, которые вешают OCCT
         if not (left_simple or right_simple):
             return None
         for op in self._weighted_order(binary_cands, self.config.binary_choice_weights):
@@ -343,6 +360,49 @@ class ASTBuilder:
                 self._restore_state(saved)
                 continue
         return None
+
+    def _build_simple_feature(self, depth: int, max_ops: int = 4) -> ASTNode:
+        """Маленький гарантированно «простой» операнд для булевых.
+
+        Лист строится ТОЛЬКО из примитивов/extrude/revolve/twist (НЕ loft/sweep —
+        они считаются «сложными» для булевых) и дополняется цепочкой дешёвых
+        модификаторов (fillet/chamfer/split/transforms). Ни одна из них не входит
+        в «сложные» операции (boolean/pattern/shell/loft/sweep/hole), поэтому
+        результат никогда не делает оба операнда сложными и не требует дорогих
+        retry, при этом восстанавливает богатство фичи (модификаторы на втором
+        операнде), как в сбалансированных булевых. Каждая операция пробуется один
+        раз и отбрасывается при неудаче — работа ограничена сверху.
+        """
+        choices = list(self.PRIMITIVE_OPS) + list(self.EXTRUDE_REVOLVE_OPS)
+        avail = [op for op in choices if self._check_limits(op)]
+        if not avail:
+            avail = [op for op in self.PRIMITIVE_OPS if self._check_limits(op)]
+        if not avail:
+            raise GenerationError("no simple leaf available")
+        op = self._weighted_order(avail, self.config.leaf_choice_weights)[0]
+        saved = self._save_state()
+        try:
+            node = self._create_leaf_solid(op, depth, 1)
+            self._validate(node)
+        except (GenerationError, ValidationError):
+            self._restore_state(saved)
+            raise
+        wraps = [op for op in ("fillet", "chamfer", "split",
+                               "translate", "rotate", "mirror")
+                 if self._check_limits(op)]
+        order = self._weighted_order(wraps, self.config.unary_choice_weights)
+        added = 0
+        for op in order:
+            if added >= max_ops:
+                break
+            saved = self._save_state()
+            try:
+                node = self._create_unary(op, node)
+                self._validate(node)
+                added += 1
+            except (GenerationError, ValidationError):
+                self._restore_state(saved)
+        return node
 
     # ------------------------------------------------------------------ #
     # Листовые операции                                                   #
@@ -365,7 +425,7 @@ class ASTBuilder:
         safe = [op for op in avail if op in self.PRIMITIVE_OPS
                 or op in self.EXTRUDE_REVOLVE_OPS]
         risky = [op for op in avail if op not in safe]
-        for _ in range(4):
+        for _ in range(2):
             pool = safe if (safe and (not risky or self.rng.random() < 0.25)) else avail
             order = self._weighted_order(pool, self.config.leaf_choice_weights)
             op = order[0]
@@ -548,7 +608,7 @@ class ASTBuilder:
                 candidates.append({"kind": "direction", "direction": tuple(direction)})
         self.rng.shuffle(candidates)
         for thickness in thicknesses:
-            for selection in candidates[:4]:
+            for selection in candidates[:2]:
                 node = ShellNode(operation="shell",
                                  parameters={"thickness": thickness, "selection": selection},
                                  children=[child])
@@ -581,7 +641,7 @@ class ASTBuilder:
         if r_max < 0.1:
             raise GenerationError("hole radius range too small")
         kinds = ["through", "blind", "cbore", "csk"]
-        for _ in range(8):
+        for _ in range(3):
             kind = str(self.rng.choice(kinds))
             radius = self.rng.uniform(0.1, r_max)
             x = self.rng.uniform(xmin + radius, xmax - radius)
@@ -667,7 +727,7 @@ class ASTBuilder:
         # bbox-прегейты: недорого (память/µs) отсекают «мёртвые» кандидаты до
         # честного исполнения OCCT-булевой операции (union ничего не добавляет,
         # cut ничего не вырезает, intersect — no-op)
-        for _ in range(5):
+        for _ in range(3):
             if op == "union":
                 jitter = self._jitter(scale=0.5 * min_dim)
             elif op == "cut":
