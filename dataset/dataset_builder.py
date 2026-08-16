@@ -40,6 +40,12 @@ class DatasetBuilder:
         base.mkdir(parents=True, exist_ok=True)
         return base
 
+    def _sample_timeout(self, index: int) -> float:
+        """Таймаут сэмпла по его сложности: лёгкие уровни не должны ждать
+        150s, зависший воркер прибивается раньше (см. config.sample_timeouts)."""
+        complexity = self.config.complexity_levels[index % len(self.config.complexity_levels)]
+        return float(self.config.sample_timeouts.get(complexity, self.config.sample_timeout))
+
     def generate_sample(self, index: int, seed: int) -> bool:
         self.executor.clear()
         try:
@@ -130,7 +136,6 @@ class DatasetBuilder:
             # 8 параллельных OCCT-процессов достаточно, чтобы насытить CPU;
             # массовый spawn десятков процессов на Windows может сбоить (WinError 87)
             workers = max(1, min(os.cpu_count() or 1, 8, num_samples))
-        timeout = float(self.config.sample_timeout)
         retries_left = {i: self.config.max_seed_retries for i in range(num_samples)}
         pending: dict = {i: int(base_seeds[i]) for i in range(num_samples)}
 
@@ -168,7 +173,7 @@ class DatasetBuilder:
                 if hung is not None:
                     break
                 try:
-                    ok = bool(futures[i].get(timeout=timeout))
+                    ok = bool(futures[i].get(timeout=self._sample_timeout(i)))
                 except mp.TimeoutError:
                     hung = i
                     break
@@ -179,12 +184,16 @@ class DatasetBuilder:
                 settle(i, ok)
 
             if hung is not None:
-                logger.error(f"Sample {hung} timed out after {timeout}s "
+                logger.error(f"Sample {hung} timed out after "
+                             f"{self._sample_timeout(hung)}s "
                              f"(OCCT op hung) — restarting with next seed")
                 # доводим независших товарищей: пока они ещё выполнялись, даём
                 # им ещё один интервал (grace) закончиться, чтобы terminate()
-                # не выбрасывал их готовую работу
-                grace_deadline = time.monotonic() + timeout
+                # не выбрасывал их готовую работу. Grace = максимум таймаута
+                # среди оставшихся, а не фиксированные 150s.
+                remaining = [j for j in futures if j != hung and j not in settled]
+                grace_deadline = time.monotonic() + (max(self._sample_timeout(j) for j in remaining)
+                                                     if remaining else 0.0)
                 for j in list(futures):
                     if j == hung or j in settled:
                         continue
