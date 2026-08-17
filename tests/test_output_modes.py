@@ -99,3 +99,26 @@ def test_start_sample_flat_resume_continues(tmp_path):
     files = sorted(p.name for p in tmp_path.iterdir())
     assert files == ["sample_00000.py", "sample_00001.py",
                      "sample_00002.py", "sample_00003.py"]
+
+
+def test_windows_do_not_change_dataset(tmp_path):
+    """Оконная обработка (window_size=4 < батча) не меняет датасет:
+    generate_dataset с окнами даёт ровно те же файлы, что прямое построение
+    каждого сэмпла по его seed из SeedSequence."""
+    import numpy as np
+    cfg = dict(complexity_levels=["easy"], split_by_complexity=False, global_seed=7)
+    a = tmp_path / "windowed"
+    b = tmp_path / "direct"
+    # 9 сэмплов при window_size=max(4,4*workers)=4 → три окна (4+4+1)
+    DatasetBuilder(GeneratorConfig(output_dir=a, **cfg)).generate_dataset(9, parallel=False)
+
+    states = np.random.SeedSequence(7).generate_state(9)
+    builder_b = DatasetBuilder(GeneratorConfig(output_dir=b, **cfg))
+    for i in range(9):
+        builder_b.generate_sample(i, int(states[i]))
+
+    a_files = {p.name: p.read_text(encoding="utf-8") for p in a.glob("*.py")}
+    b_files = {p.name: p.read_text(encoding="utf-8") for p in b.glob("*.py")}
+    assert set(a_files) == set(b_files), "windowed/direct file sets differ"
+    for name in sorted(a_files):
+        assert a_files[name] == b_files[name], f"{name} differs between windowed/direct"

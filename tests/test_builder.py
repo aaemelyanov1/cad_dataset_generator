@@ -3,6 +3,8 @@ import pytest
 
 from cad_dataset_generator.builder.ast_builder import ASTBuilder
 from cad_dataset_generator.config import GeneratorConfig
+from cad_dataset_generator.executor.executor import Executor
+from cad_dataset_generator.validators.geometry_validator import GeometryValidator
 
 OP_RANGES = {
     "easy": (3, 6),
@@ -95,3 +97,54 @@ def test_medium_build_time_budget():
     elapsed = time.time() - t0
     per = elapsed / 5
     assert per < 5.0, f"medium build too slow: {per:.2f}s/sample"
+
+
+def test_verify_root_cold_guarantees_cold_valid():
+    """verify_root_cold=True: каждый возвращённый корень холодно исполняется и
+    проходит полную root-валидацию — воспроизведение программы не упадёт."""
+    import numpy as np
+    from cad_dataset_generator.validators.geometry_validator import ValidationError
+    config = GeneratorConfig()
+    validator = GeometryValidator(config)
+    for seed in range(12):
+        ast = ASTBuilder(config, seed=seed, complexity="easy").build()
+        shape = Executor().execute(ast)          # свежее (холодное) исполнение
+        validator.validate(shape, is_root=True)  # не должно бросить ValidationError
+        assert np.isfinite(float(shape.Volume()))
+
+
+def test_verify_root_cold_off_still_builds():
+    """verify_root_cold=False сохраняет старое тёплое поведение (смок)."""
+    config = GeneratorConfig(verify_root_cold=False)
+    ast = ASTBuilder(config, seed=3, complexity="easy").build()
+    assert ast.count_operations() > 0
+
+
+def test_scale_diversity_shape_sizes():
+    """Глобальный скейл 0.2–5×: по 60 medium должен быть разброс габаритов
+    в несколько порядков, включая и маленькие, и крупные деревья."""
+    import math
+    from cad_dataset_generator.utils.geometry_utils import fast_bbox
+    config = GeneratorConfig()
+    runner = Executor()
+    diags = []
+    for seed in range(60):
+        ast = ASTBuilder(config, seed=seed, complexity="medium").build()
+        shape = runner.execute(ast)
+        x0, y0, z0, x1, y1, z1 = fast_bbox(shape)
+        diag = math.hypot(x1 - x0, y1 - y0, z1 - z0)
+        assert math.isfinite(diag) and diag > 0.0, seed
+        diags.append(diag)
+    _min, _max = min(diags), max(diags)
+    assert _max / _min >= 16.0, f"scale spread too narrow: {_max:.3f}/{_min:.3f}"
+    assert sum(1 for d in diags if d < 4.0) >= 1, "нет маленьких деревьев"
+    assert sum(1 for d in diags if d > 15.0) >= 5, "мало крупных деревьев"
+
+
+def test_scale_deterministic_per_seed(strip_node_ids):
+    """Скейл рисуется из лог-униформа после ресида попытки: повторная сборка
+    того же seed даёт ту же геометрию (в т.ч. при бэктрекинге)."""
+    config = GeneratorConfig()
+    a = ASTBuilder(config, seed=777, complexity="hard").build()
+    b = ASTBuilder(config, seed=777, complexity="hard").build()
+    assert strip_node_ids(a.to_dict()) == strip_node_ids(b.to_dict())

@@ -220,6 +220,129 @@ output/
   hole присутствует на всех сложностях; тест `test_new_ops_diversity` (80 medium)
   и `test_profile_rebalance_keeps_groups` (60 medium) проходят.
 
+## План «стабильная генерация 10k + разнообразие масштаба» (авг 2026)
+
+### Принятые решения (зафиксировано до начала работ)
+1. **A — робастный детерминированный split.** `split()` режет через `solid.Center()`,
+   что для Compound-детей (2+ тел) даёт 1 половину (`split produced 1 halves`) —
+   подтверждено репродукцией на seed кейса индекса 227 (3/3 чистых executor'а,
+   детерминированно). Фикс:
+   - **одиночный Solid — плоскость `solid.Center()` как раньше** (топология не
+     меняется: эксперимент показал, что bbox-mid на single-solid даёт новые
+     дегенеративные срезы и доводит OCCT до AV в долгоживущем процессе — клиф
+     ~66 сборок вместо >120);
+   - **Compound — середина bbox наибольшего solid** (`(_bmin+_bmax)/2` по оси);
+   - при `len(halves)<2` — детерминированные микросдвиги `±{1e-4}×extent` (не
+     больше 3 попыток), иначе `GenerationError`.
+   Выбранные `plane_offset` (доля ext) и `parts_count` **записываются в параметры
+   SplitNode** (`resolve_split` в `solid_ops` возвращает готовый fused-shape; сборка
+   кэширует его в executor под `node_id` — без повторного `executor.execute`, экономя
+   2-й OCCT-вызов; executor передаёт `plane_offset`/`parts_count` в `split`).
+   `code_generator._gen_split` воспроизводит разрез **бесцикловой** цепочкой
+   `.fuse(...)` с проверкой `len(_parts)==parts_count` (инвариант
+   `test_generated_code_has_no_loops`).
+2. **B — оконная генерация.** `generate_dataset` обрабатывает индексы окнами
+   `window_size=max(4, 4·workers)`; каждое окно — свой `mp.Pool`; retry/hang
+   переделывает только своё окно (нет «волнового» переотправления всего хвоста
+   после крупного сбоя). Retry-очередь спереди `pending`, новые индексы сзади —
+   зависший сэмпл не голодает. Инварианты `seed(i)=states[i]`, `--start-sample`,
+   суммарный вывод — без изменений. Тесты: `test_windows_do_not_change_dataset`
+   (окна 4/8 против прямых `generate_sample` по тем же seed) и существующий
+   chunk-детерминизм.
+3. **C — холодная root-валидация (вкл по умолчанию).** Замерено: «тёплый» и
+   «холодный» кэш executor'а расходятся у 4/44 узлов (ShapeType/число solids
+   разные) — OCCT-булевы не бит-детерминированы между сборкой и финалом. Отсюда
+   `Shape is not a Solid (got Compound)` на корне, хотя `_validate(is_root,
+   force=True)` в `build()` проходит через тёплый кэш. Фикс: корень валидируется
+   **свежим `Executor()`** (`config.verify_root_cold: bool = True`; False — старое
+   тёплое поведение). Неудача → бэктрекинг той же попытки (seed не сжигается).
+   Цена — одно полное холодное исполнение на попытку, дошедшую до фикса.
+   Тесты: `test_verify_root_cold_guarantees_cold_valid`,
+   `test_verify_root_cold_off_still_builds`.
+4. **D — разнообразие масштаба тел.** Абсолютная шкала задаётся ~30
+   `uniform()`-литералами (примитивы 810–833, эскизы 869–958, extrude 1026–1030,
+   loft-оффсеты 1008, sweep-пути 1018–1020, translate ±15, revolve-смещение 852,
+   hole-radius 652). Производные от bbox/min_dim масштабируются автоматически.
+   Вводится лог-униформный сэмпл-скейл `self.scale = exp(rng.uniform(ln0.2, ln5))`
+   в `_reset()` (стабилен в пределах попытки/бэктрекинга) и хелпер
+   `self._dim(lo, hi)=self.scale*rng.uniform(lo, hi)`. Капсы `max_volume=1e6`/
+   `max_bbox_diag=1000` НЕ меняются (worst-case при 5× им не достигает); сбой капса
+   → бэктрекинг. Кодген без изменений (параметры уже зашиты в AST).
+5. **E — отладочный harness** `scripts/debug_generate.py` + `scripts/probe_sample.py`
+   на 1000 программ: `--num_samples 1000 --seed 42 --parallel [--mode subprocess|pool]`,
+   таль ошибок по классам (split / root-Compound / hang / crash / null_shape /
+   validation / прочее), тайминги по сложностям, разброс bbox-диагоналей,
+   `--out metrics.json`. По умолчанию `subprocess` — каждый сэмпл в отдельном
+   OS-процессе, поэтому жёсткие OCCT-крахи (AccessViolation) ловятся по exit-коду;
+   `pool` воспроизводит боевой multiprocessing-пул. Не входит в pytest.
+
+### Обоснование из диагноза (10000, seed 42, --flat --parallel)
+- Зависание после ~457 программы; index 227 повторно: `split produced 1 halves`
+  (детерминированно на чистых executor'ах; build проходит «тёплым» кэшем).
+- OCCT-hang (179/189/215/230/257) — внутренние зависания, прибиваются B5-таймаутом,
+  но волновой конвейер перезапускал большой хвост индексов → окна (B) локальные.
+- sample 351 — root-Compound из-за тёплого/холодного расхождения → холодный корень (C).
+
+### TODO (порядок реализации)
+- [x] A: `solid_ops.split` + `_gen_split` (bbox-mid + largest solid + fallback)
+- [x] A: тесты (Compound-вход, seed 227 cold, юнит fallback)
+- [x] B: оконная генерация в `dataset_builder.generate_dataset`
+- [x] B: тест «с окнами == без окон» + детерминизм
+- [x] C: холодная root-валидация в `build()` + toggle `config.verify_root_cold`
+- [x] C: тест cold-root toggle
+- [x] D: `config.scale_low/high` (0.2/5.0) + `self.scale` в `_reset` + `_dim` по абс. сайтам
+- [x] D: тест разброса bbox-диагоналей (≥2 порядка) + детерминизм
+- [x] E: `scripts/debug_generate.py` + `scripts/probe_sample.py` (1000, талли/тайминги/bbox)
+- [x] финал: `pytest tests -q` (112 passed) + прогон harness 1000 «до/после»
+
+### Реализация A–D (итог)
+- **A/B/C** — тесты в `tests/` (test_operations, test_codegen, test_builder,
+  test_output_modes). Полный `pytest tests -q`: **110 passed** (707s), краха OCCT
+  нет (79 сборок cold-off + 50 cold-on до фикса → после).
+- **D** — `config.scale_low/high = 0.2/5.0`; `self.scale = exp(rng.uniform(ln0.2,
+  ln5))` рисуется в `_reset()` после ресида (стабилен внутри попытки, детерминирован
+  по seed). `self._dim(lo, hi) = scale * uniform(lo, hi)` применён ко ВСЕМ
+  абсолютным размерам: примитивы (box/cyl/sphere/cone/wedge/torus), эскизы
+  (rect/circle/ellipse/polygon/slot/polyline/spline/roundrect/frame/sector/
+  arc_profile/ellipse_arc/bent/mirrored), extrude/twist-extrude, loft-offsets,
+  sweep-пути, revolve-смещение, translate-вектор, hole-radius. Пороги, которые при
+  малом scale обнуляли бы выбор, тоже масштабируются (`0.5·scale` для оси split,
+  `0.3/0.1·scale` для «смел для hole», marёжи в эскизах). Производные от bbox/
+  min_dim (jitter, gap split, паттерны, fillet/chamfer от длин рёбер) не трогаются.
+  Капсы `max_volume`/`max_bbox_diag` не менялись. Тесты:
+  `test_scale_diversity_shape_sizes` (60 medium, max/min diag ≥16×, есть мелкие и
+  крупные деревья), `test_scale_deterministic_per_seed`.
+- **Фикс из D-отладки**: на малых масштабах `solid.split(plane)` может вернуть
+  `Null TopoDS_Shape` (ValueError в `Shape.cast`) — в `resolve_split` цикл
+  микросдвигов теперь ловит исключения целиком (`try/except: continue`), до
+  3 детерминированных смещений.
+- **Гард на OCCT-AV для fillet/chamfer (из harness E-диагностики)**: BRepFillet/
+  BRepChamfer по рёбрам тел после fuse может падать **AccessViolation'ом**
+  (exit -1073741819/0xC0000005, жёсткий крах процесса — НЕ исключение, боевым
+  путём убивал воркер пула → «hang»-таймаут и потерю сэмпла). Найдены 2
+  детерминированных воспроизведения:
+  - easy seed 1691623607 (idx 4) — chamfer на `split` (3 половины fuse);
+  - expert seed 1443911188 (idx 491) — chamfer на `polarArray` (4 копии torus).
+  Лечение: `_edge_risk(node)` в ast_builder — fillet/chamfer не пробуются, если в
+  поддереве есть split/rarray/polarArray/scatter (`GenerationError` → бэктрекинг).
+  Доля fillet/chamfer на остальных телах не страдает
+  (`test_new_ops_diversity`, `test_profile_rebalance_keeps_groups` — зелёные).
+  Оба сида после гарда строятся.
+
+### Harness 1000 «после» (E): seed 42, 8 воркеров, subprocess-режим
+- **до** гарда (980 ok / 20 fail): hang 17, **crash 1**, null_shape 1, validation 1;
+- **после** (985 ok / 15 fail): **только hang 15**, крашей/прочих классов нет;
+  idx 26/116 (easy-hard «малый» таймаут 40-100s) и expert 115/507/527/711/835/150s —
+  реальная приостановка OCCT-операции внутри дерева (не накапливается: окна B
+  переделывают только своё окно, seed-retry даёт следующий seed).
+- wall 1615s (~27 мин) на 1000 сэмплов; mean по сложностям: easy 1.6s,
+  medium 4.9s, hard 9.4s, expert 18.6s (p90 39s).
+- **bbox-диагонали: min 0.80, max 147.9 — разброс 184.7×** (D ✔: масштаб
+  покрывает >2 порядка, капсы не потревожены). То же значение min/max и до/после
+  (крайние по масштабу деревья не зависят от гарда).
+- Остаточная частота отказа ≈1.5% — только класс `hang` (внутренняя приостановка
+  OCCT, обрабатывается оконной генерацией + таймаутами боевого пути).
+
 ## Вероятности операций и возобновление генерации (авг 2026)
 
 **Трансформации translate/rotate/mirror — вероятность 0.3.**

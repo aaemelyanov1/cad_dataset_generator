@@ -24,11 +24,24 @@ class GeneratorConfig:
     max_volume: float = 1e6
     min_bbox_diag: float = 0.1
     max_bbox_diag: float = 1000.0
+    # разнообразие масштаба тел: на каждый билд применяется лог-униформный
+    # множитель scale ∈ [scale_low, scale_high] ко ВСЕМ абсолютным размерам
+    # (примитивы, эскизы, экструзии, пути, translate-векторы). Производные от
+    # bbox/min_dim масштабируются автоматически; капсы max_volume/max_bbox_diag
+    # отсекают выпадающие деревья бэктрекингом (scale рисуется заново на попытку).
+    scale_low: float = 0.2
+    scale_high: float = 5.0
     fillet_radius_ratio: float = 0.1
     shell_thickness_ratio: float = 0.02
     backtrack_attempts: int = 60
     max_seed_retries: int = 50
     sample_timeout: float = 150.0
+    # холодная root-валидация: корень исполняется СВЕЖИМ Executor'ом (тёплый кэш
+    # билдера может расходиться с финальным исполнением из-за небит-детерминизма
+    # OCCT-булевых → «Shape is not a Solid (got Compound)»). Цена — +1 полное
+    # исполнение на успешную попытку сборки; отфильтровывает деревья, которые
+    # упали бы при генерации/воспроизведении. False — старое тёплое поведение.
+    verify_root_cold: bool = True
     # таймаут зависшего сэмпла по сложности: лёгкие уровни живут ~attempt_timeout*4
     # (easy 32s, medium 60s, hard 80s, expert 120s), ждать 150s на easy бессмысленно
     sample_timeouts: Dict[str, float] = field(default_factory=lambda: {

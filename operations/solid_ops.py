@@ -238,26 +238,120 @@ def hole(solid: cq.Shape, position, radius: float, depth: float,
         raise GenerationError(f"hole cut failed: {e}") from e
 
 
-def split(solid: cq.Shape, axis: str, gap: float) -> cq.Shape:
-    """Разрез тела плоскостью через центр со сдвигом одной половины.
+# детерминированный подбор плоскости: сначала в середине bbox (обычно достаточно),
+# затем два малых смещения для граничных случаев (плоскость на ребре/вершине).
+# Больше попыток не делаем: более экзотичные расклады — валидатор/бэктрекинг.
+_SPLIT_OFFSETS = (0.0, 1e-4, -1e-4)
 
-    Тело разрезается плоскостью, перпендикулярной `axis`, проходящей через центр;
-    одна из половин сдвигается вдоль `axis` к другой (перекрытие), после чего
-    половины fuse-ятся в единый Solid. В результате получается «ступенчатый»
-    разрез — тело, у которого половина сдвинута внутрь.
+
+def _split_reference(solid: cq.Shape, axis: str):
+    """Возвращает (ref_solid, plane_center, extent_по_axis).
+
+    Для одиночного Solid центр плоскости — `solid.Center()` (в точности старое
+    поведение). Для Compound — центр bbox **наибольшего** solid'а: `shape.Center()`
+    у составных тел (TopoDS-pivot) давал плоскости мимо середины и
+    «split produced 1 halves».
+    """
+    solids = list(solid.Solids())
+    if not solids:
+        raise GenerationError("split: shape has no solids")
+    ref = max(solids, key=lambda s: float(s.Volume()))
+    if len(solids) == 1:
+        center = solid.Center()
+    else:
+        bb = ref.BoundingBox()
+        center = cq.Vector((bb.xmin + bb.xmax) / 2.0,
+                           (bb.ymin + bb.ymax) / 2.0,
+                           (bb.zmin + bb.zmax) / 2.0)
+    bb = ref.BoundingBox()
+    low = {"X": bb.xmin, "Y": bb.ymin, "Z": bb.zmin}[axis]
+    high = {"X": bb.xmax, "Y": bb.ymax, "Z": bb.zmax}[axis]
+    extent = float(high - low)
+    if extent <= 0.0:
+        raise GenerationError("split: zero extent along axis")
+    return ref, center, extent
+
+
+def resolve_split(solid: cq.Shape, axis: str, gap: float):
+    """Детерминированный разрез с подбором плоскости.
+
+    Пробует микросдвиги плоскости вдоль `axis` (0, ±1e-4)×extent, берёт первый,
+    дающий >= 2 частей, и возвращает `(plane_offset_fraction, parts_count,
+    fused_shape)`. Число частей фиксируется, чтобы code-генератор воспроизвёл
+    тот же fuse без циклов в программе. Бросает GenerationError.
     """
     axis_vec = {"X": cq.Vector(1, 0, 0),
                 "Y": cq.Vector(0, 1, 0),
                 "Z": cq.Vector(0, 0, 1)}.get(axis)
     if axis_vec is None:
         raise GenerationError(f"Unknown split axis: {axis}")
+    _, center, extent = _split_reference(solid, axis)
+    shift = axis_vec * (-float(gap))
+    for off in _SPLIT_OFFSETS:
+        plane = cq.Face.makePlane(1e6, 1e6,
+                                  center + axis_vec * (off * extent), axis_vec)
+        try:
+            parts = list(solid.split(plane).Solids())
+        except Exception:
+            # OCCT может вернуть Null TopoDS_Shape (или бросить) при
+            # вырожденном разрезе (плоскость по грани/вершине, особенно на
+            # малых масштабах, где линейная точность не видна) — пробуем
+            # следующий микросдвиг плоскости
+            continue
+        if len(parts) < 2:
+            continue
+        parts.sort(key=lambda s: (float(s.Center().x),
+                                  float(s.Center().y),
+                                  float(s.Center().z)))
+        fused = parts[0]
+        for p in parts[1:]:
+            fused = fused.fuse(p.translate(shift))
+        return off, len(parts), fused
+    raise GenerationError("split produced <2 halves for all fallback planes")
+
+
+def split(solid: cq.Shape, axis: str, gap: float, plane_offset: float = None,
+          parts_count: int = None) -> cq.Shape:
+    """Разрез тела плоскостью со сдвигом части половин.
+
+    Плоскость перпендикулярна `axis`; опорный центр — `solid.Center()` для
+    одиночного Solid и середина bbox наибольшего solid'а для Compound
+    (см. `_split_reference`). Если `plane_offset` не задан — плоскость
+    подбирается детерминированно (`resolve_split`); иначе используется переданный
+    (тот, что ASTBuilder зафиксировал в параметрах узла). Все части сортируются по
+    координате вдоль `axis`; часть с минимальной координатой остаётся на месте,
+    остальные смещаются на `gap` к ней (перекрытие), затем всё fuse-ится в единый
+    Solid — «ступенчатый» разрез тела. При заданном `parts_count` обязательный
+    процент совпадения числа частей (программа воспроизводит итог без циклов).
+    """
+    if plane_offset is None:
+        try:
+            _, _, fused = resolve_split(solid, axis, float(gap))
+            return fused
+        except GenerationError:
+            raise
+        except Exception as e:
+            raise GenerationError(f"split failed: {e}") from e
+    axis_vec = {"X": cq.Vector(1, 0, 0),
+                "Y": cq.Vector(0, 1, 0),
+                "Z": cq.Vector(0, 0, 1)}[axis]
     try:
-        plane = cq.Face.makePlane(1e6, 1e6, solid.Center(), axis_vec)
-        halves = list(solid.split(plane).Solids())
-        if len(halves) != 2:
-            raise GenerationError(f"split produced {len(halves)} halves")
-        shifted = halves[1].translate(axis_vec * (-float(gap)))
-        return halves[0].fuse(shifted)
+        _, center, extent = _split_reference(solid, axis)
+        plane = cq.Face.makePlane(1e6, 1e6,
+                                  center + axis_vec * (plane_offset * extent), axis_vec)
+        parts = list(solid.split(plane).Solids())
+        if len(parts) < 2:
+            raise GenerationError(f"split produced {len(parts)} halves")
+        if parts_count is not None and len(parts) != parts_count:
+            raise GenerationError(f"split produced {len(parts)} parts, expected {parts_count}")
+        parts.sort(key=lambda s: (float(s.Center().x),
+                                  float(s.Center().y),
+                                  float(s.Center().z)))
+        shift = axis_vec * (-float(gap))
+        fused = parts[0]
+        for p in parts[1:]:
+            fused = fused.fuse(p.translate(shift))
+        return fused
     except GenerationError:
         raise
     except Exception as e:

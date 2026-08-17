@@ -389,18 +389,44 @@ def _gen_hole(node: HoleNode):
 def _gen_split(node: SplitNode):
     child_lines, child_var = _gen_node(node.children[0])
     p = node.parameters
+    axis = p["axis"]
     axis_vec = {"X": "cq.Vector(1, 0, 0)",
                 "Y": "cq.Vector(0, 1, 0)",
-                "Z": "cq.Vector(0, 0, 1)"}[p["axis"]]
+                "Z": "cq.Vector(0, 0, 1)"}[axis]
+    low_expr = {"X": "_bb.xmin", "Y": "_bb.ymin", "Z": "_bb.zmin"}[axis]
+    high_expr = {"X": "_bb.xmax", "Y": "_bb.ymax", "Z": "_bb.zmax"}[axis]
     gap = float(p["gap"])
+    plane_offset = float(p.get("plane_offset", 0.0))
+    parts_count = int(p.get("parts_count", 2))
     var = _next_var()
+    # зеркалит operations.solid_ops.split: единый Solid — плоскость через Center(),
+    # Compound — через середину bbox наибольшего тела; сдвиг частей к минимальной
+    # по axis координате. Плоскость берётся с зафиксированным при сборке
+    # plane_offset, а fuse — цепочкой без циклов (частей parts_count).
     lines = child_lines + [
-        f"_plane = cq.Face.makePlane(1000000.0, 1000000.0, {child_var}.Center(), {axis_vec})",
-        f"_halves = {child_var}.split(_plane)",
-        f"_parts = list(_halves.Solids())",
-        f"_shifted = _parts[1].translate({axis_vec} * ({_fmt(-gap)}))",
-        f"{var} = _parts[0].fuse(_shifted)",
+        f"_solids = list({child_var}.Solids())",
+        f"if not _solids:",
+        f"    raise RuntimeError('split: shape has no solids')",
+        f"_ref = max(_solids, key=lambda s: s.Volume())",
+        f"_bb = _ref.BoundingBox()",
+        f"if len(_solids) == 1:",
+        f"    _center = {child_var}.Center()",
+        f"else:",
+        f"    _center = cq.Vector((_bb.xmin + _bb.xmax) / 2.0, "
+        f"(_bb.ymin + _bb.ymax) / 2.0, (_bb.zmin + _bb.zmax) / 2.0)",
+        f"_ext = {high_expr} - {low_expr}",
+        f"_shift = {axis_vec} * ({_fmt(-gap)})",
+        f"_plane = cq.Face.makePlane(1000000.0, 1000000.0, "
+        f"_center + {axis_vec} * ({_fmt(plane_offset)} * _ext), {axis_vec})",
+        f"_parts = list({child_var}.split(_plane).Solids())",
+        f"if len(_parts) != {parts_count}:",
+        f"    raise RuntimeError('split produced unexpected part count')",
+        f"_parts.sort(key=lambda s: (s.Center().x, s.Center().y, s.Center().z))",
     ]
+    fused = f"_parts[0]"
+    for i in range(1, parts_count):
+        fused += f".fuse(_parts[{i}].translate(_shift))"
+    lines.append(f"{var} = {fused}")
     return lines, var
 
 
