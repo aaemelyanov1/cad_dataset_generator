@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 import numpy as np
 from ..config import GeneratorConfig
+from ..exceptions import GenerationError
+from ..validators.geometry_validator import ValidationError
 from ..builder.ast_builder import ASTBuilder
 from ..executor.executor import Executor
 from ..validators.geometry_validator import GeometryValidator
@@ -80,9 +82,16 @@ class DatasetBuilder:
             logger.info(f"Sample {index} generated successfully.")
             return True
         except Exception as e:
-            logger.error(f"Failed to generate sample {index}: {e}")
-            traceback.print_exc()
             complexity = self.config.complexity_levels[index % len(self.config.complexity_levels)]
+            if isinstance(e, (GenerationError, ValidationError)):
+                # известные классы отказов сэмпла — одна строка (без толстого
+                # traceback): причина уже зашита в сообщение, сэмпл уйдёт на retry
+                logger.error(f"Failed to generate sample {index} ({complexity}): "
+                             f"{type(e).__name__}: {e}")
+            else:
+                # неизвестный класс — полный трейсбек для диагностики
+                logger.error(f"Failed to generate sample {index} ({complexity}): {e}")
+                traceback.print_exc()
             sample_dir = self._sample_base_dir(complexity) / f"sample_{index:05d}"
             if not self._programs_only and sample_dir.exists():
                 import shutil
