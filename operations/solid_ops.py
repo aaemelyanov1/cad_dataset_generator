@@ -115,12 +115,20 @@ def sweep(profile_op: str, profile_params: Dict[str, Any], path: Dict[str, Any])
 
 def select_edges(solid: cq.Shape, selection: Dict[str, Any], limit: int = 2):
     kind = selection.get("kind", "nearest")
-    if kind == "nearest":
-        pt = tuple(float(c) for c in selection["point"])
-        return cq.NearestToPointSelector(pt).filter(solid.Edges())[:limit]
-    if kind == "direction":
-        d = tuple(float(c) for c in selection["direction"])
-        return cq.DirectionSelector(cq.Vector(*d)).filter(solid.Edges())[:limit]
+    try:
+        if kind == "nearest":
+            pt = tuple(float(c) for c in selection["point"])
+            return cq.NearestToPointSelector(pt).filter(solid.Edges())[:limit]
+        if kind == "direction":
+            d = tuple(float(c) for c in selection["direction"])
+            return cq.DirectionSelector(cq.Vector(*d)).filter(solid.Edges())[:limit]
+    except GenerationError:
+        raise
+    except Exception as e:
+        # OCCT-селекторы могут бросать сырые исключения на вырожденных кривых
+        # (Standard_ConstructionError из tangentAt/paramAt) — это вырожденный
+        # подбор, а не авария
+        raise GenerationError(f"edge selection failed: {e}") from e
     raise GenerationError(f"Unknown edge selection kind: {kind}")
 
 
@@ -255,18 +263,25 @@ def _split_reference(solid: cq.Shape, axis: str):
     solids = list(solid.Solids())
     if not solids:
         raise GenerationError("split: shape has no solids")
-    ref = max(solids, key=lambda s: float(s.Volume()))
-    if len(solids) == 1:
-        center = solid.Center()
-    else:
+    try:
+        ref = max(solids, key=lambda s: float(s.Volume()))
+        if len(solids) == 1:
+            center = solid.Center()
+        else:
+            bb = ref.BoundingBox()
+            center = cq.Vector((bb.xmin + bb.xmax) / 2.0,
+                               (bb.ymin + bb.ymax) / 2.0,
+                               (bb.zmin + bb.zmax) / 2.0)
         bb = ref.BoundingBox()
-        center = cq.Vector((bb.xmin + bb.xmax) / 2.0,
-                           (bb.ymin + bb.ymax) / 2.0,
-                           (bb.zmin + bb.zmax) / 2.0)
-    bb = ref.BoundingBox()
-    low = {"X": bb.xmin, "Y": bb.ymin, "Z": bb.zmin}[axis]
-    high = {"X": bb.xmax, "Y": bb.ymax, "Z": bb.zmax}[axis]
-    extent = float(high - low)
+        low = {"X": bb.xmin, "Y": bb.ymin, "Z": bb.zmin}[axis]
+        high = {"X": bb.xmax, "Y": bb.ymax, "Z": bb.zmax}[axis]
+        extent = float(high - low)
+    except GenerationError:
+        raise
+    except Exception as e:
+        # OCCT: BoundingBox/Volume могут кинуть Standard_ConstructionError
+        # ("Bnd_Box is void"), если твердь вырожденная — отказ попытки
+        raise GenerationError(f"split reference failed: {e}") from e
     if extent <= 0.0:
         raise GenerationError("split: zero extent along axis")
     return ref, center, extent
@@ -292,21 +307,25 @@ def resolve_split(solid: cq.Shape, axis: str, gap: float):
                                   center + axis_vec * (off * extent), axis_vec)
         try:
             parts = list(solid.split(plane).Solids())
+            if len(parts) < 2:
+                continue
+            parts.sort(key=lambda s: (float(s.Center().x),
+                                      float(s.Center().y),
+                                      float(s.Center().z)))
+            fused = parts[0]
+            for p in parts[1:]:
+                fused = fused.fuse(p.translate(shift))
+            if fused is None:
+                continue
+            return off, len(parts), fused
+        except GenerationError:
+            raise
         except Exception:
-            # OCCT может вернуть Null TopoDS_Shape (или бросить) при
-            # вырожденном разрезе (плоскость по грани/вершине, особенно на
-            # малых масштабах, где линейная точность не видна) — пробуем
-            # следующий микросдвиг плоскости
+            # OCCT может вернуть Null TopoDS_Shape/бросить (вырожденный разрез,
+            # плоскость по грани/вершине, особенно на малых масштабах, где
+            # линейная точность не видна; fuse половин тоже способен дать Null) —
+            # пробуем следующий микросдвиг плоскости
             continue
-        if len(parts) < 2:
-            continue
-        parts.sort(key=lambda s: (float(s.Center().x),
-                                  float(s.Center().y),
-                                  float(s.Center().z)))
-        fused = parts[0]
-        for p in parts[1:]:
-            fused = fused.fuse(p.translate(shift))
-        return off, len(parts), fused
     raise GenerationError("split produced <2 halves for all fallback planes")
 
 

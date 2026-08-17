@@ -343,6 +343,44 @@ output/
 - Остаточная частота отказа ≈1.5% — только класс `hang` (внутренняя приостановка
   OCCT, обрабатывается оконной генерацией + таймаутами боевого пути).
 
+### Реальный прогон 10000 (seed 42, --flat --parallel) и Фаза 1 (авг 2026)
+Прогон `main.py --num_samples 10000 --output output --seed 42 --parallel --flat`:
+02:36→11:16 (~8.7 ч), «Dataset generation finished», ни одного
+«failed after 50 seed retries» (все дорогие индексы дошли до файла, выход ~10000
+`.py`). **Distinct индексов с событиями ≈116 из 10000 (1.16%)**:
+- `timed out` (hang) 100 строк; повторы индексов 3343 и 7778 (завис на 2 разных
+  seed подряд — retry снова попал в hang), остальные — по одному разу;
+- `Failed to build ... after 60 attempts`: 6 (116, 2449, 3209, 5813, 5919, 8528) —
+  систематический отбой всей низкомасштабной ветки (fallback empty: 0.2× → тело
+  не тянет min_volume/min_bbox_diag + холодный корень);
+- **сырые OCC-исключения, уходившие ЗА пределы `build()`** (не `GenerationError`!)
+  и ронявшие сэмпл первой попыткой, минуя цикл из 60: `Null TopoDS_Shape` из
+  `fused.fuse()` в split (8×), `Bnd_Box is void` из `ref.BoundingBox()` (2×),
+  `Standard_ConstructionError` из `select_edges` (1×) — это дефект Фазы 1;
+- 1× `chamfer failed: BRep_API: command not done` на реплее в `generate_sample`
+  (остаточный бит-недетерминизм OCCT между независимыми холодными исполнителями,
+  ~0.01%, штатно уходит на seed-retry).
+
+**Фаза 1 (реализована):** сырые OCC-ошибки переведены в `GenerationError`, чтобы
+их перехватывал цикл попыток `build()`:
+- `resolve_split`: try/except накрывает ВЕСЬ подбор партии, включая fuse-цепочку
+  `fused.fuse(p.translate(shift))` (раньше ловился только `solid.split()`);
+- `_split_reference`: `BoundingBox()`/`Volume()`/`Center()` → `GenerationError`
+  («split reference failed: ...»);
+- `select_edges`: `DirectionSelector.filter` → `GenerationError` («edge selection
+  failed: ...») при вырожденных кривых (`tangentAt/paramAt`);
+- страховка в `build()`: `except Exception -> continue` (после TimeoutError/
+  GenerationError/ValidationError) — любое будущее сырое OCC-исключение =
+  пропуск попытки, а не падение сэмпла (валидность итогового дерева всё равно
+  гарантирует валидатор, молчаливый retry безопасен);
+- `generate_sample`: известные классы (`GenerationError`/`ValidationError`) — одна
+  строка в логе без трассы; полный traceback остаётся для неизвестных классов.
+
+Тесты после Фазы 1: test_operations (73) + test_codegen (73) + test_builder (14) +
+test_output_modes (8) — зелёные; мажоритарного регресса нет.
+Ожидание на следующем прогоне: «Failed to generate sample» сократится до build-exhaust
+(6) и редкого chamfer-replay; Null/Bnd/Construction станут внутренними ретраями.
+
 ## Вероятности операций и возобновление генерации (авг 2026)
 
 **Трансформации translate/rotate/mirror — вероятность 0.3.**

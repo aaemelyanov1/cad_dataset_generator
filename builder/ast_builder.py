@@ -144,6 +144,13 @@ class ASTBuilder:
                 continue
             except (GenerationError, ValidationError):
                 continue
+            except Exception:
+                # страховка от «сырых» OCC-исключений (Null TopoDS_Shape,
+                # Standard_ConstructionError из селекторов/BoundingBox и т.п.),
+                # которые не обёрнуты в GenerationError: попытка отбрасывается,
+                # а не роняет весь сэмпл (валидность СЛОЖЕННОГО дерева всё равно
+                # гарантирует валидатор, поэтому молчаливый retry безопасен)
+                continue
         raise GenerationError(
             f"Failed to build a {self.complexity} model after {self.backtrack_attempts} attempts "
             f"(target ops {self.target_min}-{self.target_max}, wall-clock capped)"
