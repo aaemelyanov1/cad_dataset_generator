@@ -52,6 +52,26 @@ def test_split_reduces_volume():
     assert 0 < _volume(s) < base_vol
 
 
+def test_split_compound_input():
+    """Compound из перекрывающихся тел режется в единый Solid (регрессия
+    «split produced 1 halves» через Center())."""
+    import cadquery as cq
+    b1 = make_box(4, 4, 4)
+    b2 = make_box(2, 2, 2).translate((1, 1, 1))
+    compound = cq.Compound.makeCompound([b1, b2])
+    assert len(list(compound.Solids())) == 2
+    s = unwrap_solid(split(compound, "X", 1.0))
+    assert len(list(s.Solids())) == 1
+    assert _volume(s) > 0
+
+
+def test_split_deterministic():
+    base = make_box(6, 4, 3)
+    a = unwrap_solid(split(base, "Z", 0.9))
+    b = unwrap_solid(split(base, "Z", 0.9))
+    assert float(a.Volume()) == pytest.approx(float(b.Volume()), rel=1e-9)
+
+
 @pytest.mark.parametrize("kind,pos,depth,extra", [
     ("through", (0.0, 0.0, -1.0), 8.0, {}),
     ("blind", (0.0, 0.0, 3.0), 2.0, {}),

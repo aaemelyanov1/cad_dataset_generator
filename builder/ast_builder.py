@@ -30,10 +30,10 @@ from ..syntax_tree.nodes import (
 )
 from ..executor.executor import Executor
 from ..validators.geometry_validator import GeometryValidator, ValidationError
-from ..utils.geometry_utils import fast_bbox
+from ..utils.geometry_utils import fast_bbox, unwrap_solid
 from ..config import GeneratorConfig
 from ..exceptions import GenerationError
-from ..operations.solid_ops import select_edges
+from ..operations.solid_ops import select_edges, resolve_split
 
 
 @dataclass
@@ -65,6 +65,9 @@ class ASTBuilder:
         self.complexity = complexity
         self.base_seed = seed if seed is not None else config.global_seed
         self.rng: np.random.Generator = np.random.default_rng(self.base_seed)
+        # масштаб модели: задаётся в `_reset` (первый же вызов сборки) из
+        # лог-униформного диапазона; 1.0 — безопасный дефолт до сборки
+        self.scale: float = 1.0
         self.executor = Executor()
         self.validator = GeometryValidator(config)
 
@@ -118,8 +121,17 @@ class ASTBuilder:
                 target = int(self.rng.integers(self.target_min, self.target_max + 1))
                 self.target_ops = target
                 node = self._build_solid(0, target)
-                # финальная проверка корня как единого целого (всегда полная)
-                self._validate(node, is_root=True, force=True)
+                if self.config.verify_root_cold:
+                    # финальная проверка корня СВЕЖИМ исполнением: тёплый кэш
+                    # (self._validate(force=True) ходит через executor) может
+                    # расходиться с итоговой геометрией из-за небит-детерминизма
+                    # OCCT между состояниями; отфильтровываем такие деревья здесь,
+                    # а не падением на этапе генерации/воспроизведения
+                    cold_shape = Executor().execute(node)
+                    self.validator.validate(cold_shape, is_root=True)
+                else:
+                    # финальная проверка корня как единого целого (тёплый путь)
+                    self._validate(node, is_root=True, force=True)
                 count = node.count_operations()
                 if self.target_min <= count <= self.target_max:
                     return node
@@ -139,6 +151,12 @@ class ASTBuilder:
 
     def _reset(self, attempt: int):
         self.rng = np.random.default_rng(self.base_seed + attempt * 1000003)
+        # масштаб модели на попытку (лог-униформ): рисуется ПОСЛЕ ресида, чтобы
+        # оставаться детерминированным и стабильным внутри попытки (в т.ч. при
+        # _save_state/_restore_state бэктрекинга). Геометрия инвариантна к scale:
+        # все производные параметры берутся из уже масштабированных размеров.
+        sl, sh = self.config.scale_low, self.config.scale_high
+        self.scale = float(np.exp(self.rng.uniform(np.log(sl), np.log(sh))))
         self.total_ops = 0
         self.operation_counts = {k: 0 for k in self.operation_counts}
         self.executor.clear()
@@ -548,7 +566,36 @@ class ASTBuilder:
         direction[{"X": 0, "Y": 1, "Z": 2}[axis]] = sign
         return {"kind": "direction", "direction": tuple(direction)}
 
+    @staticmethod
+    def _contains_split(node: ASTNode) -> bool:
+        """Есть ли в дереве узел split (в т.ч. внутри поддерева)."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if getattr(n, "operation", None) == "split":
+                return True
+            stack.extend(getattr(n, "children", None) or [])
+        return False
+
+    @staticmethod
+    def _edge_risk(node: ASTNode) -> bool:
+        """Есть ли в дереве узлы, после fuse которых OCCT BRepFillet/BRepChamfer
+        может упасть AccessViolation'ом (не исключением) — split и массивы
+        (rarray/polarArray/scatter) склеивают копии/половины, и фаска по шву
+        детерминированно валит процесс. Такие тела для fillet/chamfer не берём."""
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if getattr(n, "operation", None) in ("split", "rarray", "polarArray", "scatter"):
+                return True
+            stack.extend(getattr(n, "children", None) or [])
+        return False
+
     def _try_fillet(self, child: ASTNode) -> FilletNode:
+        if self._edge_risk(child):
+            # OCCT BRepFillet по рёбрам половин/швам fuse-копий может упасть
+            # AccessViolation-крашем (не исключение) — не трогаем
+            raise GenerationError("fillet after split/array skipped (OCCT AV risk)")
         base = self.executor.execute(child)
         edges = list(base.edges())
         if not edges:
@@ -574,6 +621,8 @@ class ASTBuilder:
         return node
 
     def _try_chamfer(self, child: ASTNode) -> ChamferNode:
+        if self._edge_risk(child):
+            raise GenerationError("chamfer after split/array skipped (OCCT AV risk)")
         base = self.executor.execute(child)
         edges = list(base.edges())
         if not edges:
@@ -640,21 +689,21 @@ class ASTBuilder:
         w = xmax - xmin
         h = ymax - ymin
         d = zmax - zmin
-        if w < 0.3 or h < 0.3 or d < 0.3:
+        if w < 0.3 * self.scale or h < 0.3 * self.scale or d < 0.3 * self.scale:
             raise GenerationError("solid too thin for hole")
         base_vol = float(base.Volume())
         r_max = min(w, h) * 0.4
-        if r_max < 0.1:
+        if r_max < 0.1 * self.scale:
             raise GenerationError("hole radius range too small")
         kinds = ["through", "blind", "cbore", "csk"]
         for _ in range(3):
             kind = str(self.rng.choice(kinds))
-            radius = self.rng.uniform(0.1, r_max)
+            radius = self.rng.uniform(0.1 * self.scale, r_max)
             x = self.rng.uniform(xmin + radius, xmax - radius)
             y = self.rng.uniform(ymin + radius, ymax - radius)
             params: Dict[str, Any] = {"kind": kind, "radius": radius}
             if kind == "through":
-                margin = max(0.5, 0.2 * min(w, h, d))
+                margin = max(0.5 * self.scale, 0.2 * min(w, h, d))
                 params["position"] = (x, y, zmin - margin)
                 params["depth"] = d + 2.0 * margin
             else:
@@ -691,8 +740,9 @@ class ASTBuilder:
         base = self.executor.execute(child)
         xmin, xmax, ymin, ymax, zmin, zmax = self._bbox(base)
         extents = {"X": xmax - xmin, "Y": ymax - ymin, "Z": zmax - zmin}
-        # оси по убыванию размера: на длинной оси перекрытие половин надёжнее
-        axes = [ax for ax in ("X", "Y", "Z") if extents[ax] >= 0.5]
+        # оси по убыванию размера: на длинной оси перекрытие половин надёжнее;
+        # порог пропорционален масштабу модели
+        axes = [ax for ax in ("X", "Y", "Z") if extents[ax] >= 0.5 * self.scale]
         if not axes:
             raise GenerationError("solid too small for split")
         axes.sort(key=lambda ax: extents[ax], reverse=True)
@@ -701,11 +751,22 @@ class ASTBuilder:
             # один gap на ось: plane-cut+fuse дорогой (два B-Rep вызова),
             # retry-серии из 9 исполнений давали 46-49% общего времени
             gap = float(self.rng.uniform(0.25, 0.4)) * extents[axis]
-            node = SplitNode(operation="split",
-                             parameters={"axis": axis, "gap": gap},
-                             children=[child])
+            # детерминированный разрез ДО исполнения узла: выбранные
+            # plane_offset/parts_count фиксируются в параметрах, чтобы code-генератор
+            # воспроизвёл тот же разрез без циклов; результат кэшируем под node_id
+            # напрямую — executor.execute(node) больше не вызывается (был бы 2-й OCCT-вызов).
             try:
-                shape = self.executor.execute(node)
+                plane_offset, parts_count, fused = resolve_split(base, axis, gap)
+            except GenerationError:
+                continue
+            node = SplitNode(operation="split",
+                             parameters={"axis": axis, "gap": gap,
+                                         "plane_offset": float(plane_offset),
+                                         "parts_count": int(parts_count)},
+                             children=[child])
+            shape = unwrap_solid(fused)
+            self.executor.cache[node.node_id] = shape
+            try:
                 self.validator.validate(shape)
                 vol = float(shape.Volume())
                 if not np.isfinite(vol) or vol < self.config.min_volume:
@@ -804,32 +865,37 @@ class ASTBuilder:
     # ------------------------------------------------------------------ #
     # Примитивы и эскизы                                                  #
     # ------------------------------------------------------------------ #
+    def _dim(self, lo: float, hi: float) -> float:
+        """Абсолютный размер, масштабированный глобальным scale модели."""
+        return float(self.scale * self.rng.uniform(lo, hi))
+
     def _create_primitive(self, op: str) -> PrimitiveNode:
         params: Dict[str, Any] = {}
         if op == "box":
-            params = {"length": float(self.rng.uniform(1, 10)),
-                      "width": float(self.rng.uniform(1, 10)),
-                      "height": float(self.rng.uniform(1, 10))}
+            params = {"length": self._dim(1, 10),
+                      "width": self._dim(1, 10),
+                      "height": self._dim(1, 10)}
         elif op == "cylinder":
-            params = {"height": float(self.rng.uniform(1, 15)),
-                      "radius": float(self.rng.uniform(0.5, 5))}
+            params = {"height": self._dim(1, 15),
+                      "radius": self._dim(0.5, 5)}
         elif op == "sphere":
-            params = {"radius": float(self.rng.uniform(0.5, 5))}
+            params = {"radius": self._dim(0.5, 5)}
         elif op == "cone":
-            params = {"height": float(self.rng.uniform(1, 15)),
-                      "radius1": float(self.rng.uniform(0.5, 5)),
-                      "radius2": float(self.rng.uniform(0.1, 5))}
+            params = {"height": self._dim(1, 15),
+                      "radius1": self._dim(0.5, 5),
+                      "radius2": self._dim(0.1, 5)}
         elif op == "wedge":
-            dx = float(self.rng.uniform(1, 10))
-            dy = float(self.rng.uniform(1, 10))
-            dz = float(self.rng.uniform(1, 10))
-            xmax = float(self.rng.uniform(1, dx))
-            zmax = float(self.rng.uniform(1, dz))
+            dx = self._dim(1, 10)
+            dy = self._dim(1, 10)
+            dz = self._dim(1, 10)
+            xmax = float(self.rng.uniform(self.scale, dx))
+            zmax = float(self.rng.uniform(self.scale, dz))
             params = {"dx": dx, "dy": dy, "dz": dz,
                       "xmin": 0.0, "zmin": 0.0, "xmax": xmax, "zmax": zmax}
         elif op == "torus":
-            r1 = float(self.rng.uniform(1, 5))
-            r2 = float(self.rng.uniform(0.2, min(2.5, r1 * 0.7)))
+            r1 = self._dim(1, 5)
+            r2 = float(self.rng.uniform(0.2 * self.scale,
+                                         min(2.5 * self.scale, r1 * 0.7)))
             params = {"radius1": r1, "radius2": r2}
         return PrimitiveNode(operation=op, parameters=params)
 
@@ -849,13 +915,13 @@ class ASTBuilder:
         if kind == "revolve":
             # профиль обязан быть смещён от оси вращения
             extent = self._sketch_extent(op, params)
-            params["center"] = (float(extent + self.rng.uniform(0.5, 3.0)), 0.0)
+            params["center"] = (float(extent + self._dim(0.5, 3.0)), 0.0)
             params["workplane"] = "XY"
         elif kind == "loft":
             params["center"] = (0.0, 0.0)
             params["workplane"] = "XY"
         elif kind == "sweep_profile":
-            params = {"radius": float(self.rng.uniform(0.3, 1.5))}
+            params = {"radius": self._dim(0.3, 1.5)}
             params["center"] = (0.0, 0.0)
             params["workplane"] = "XY"
             op = "circle"
@@ -866,95 +932,100 @@ class ASTBuilder:
 
     def _sketch_params(self, op: str) -> Dict[str, Any]:
         if op == "rect":
-            return {"width": float(self.rng.uniform(0.5, 8)),
-                    "height": float(self.rng.uniform(0.5, 8))}
+            return {"width": self._dim(0.5, 8),
+                    "height": self._dim(0.5, 8)}
         if op == "circle":
-            return {"radius": float(self.rng.uniform(0.5, 5))}
+            return {"radius": self._dim(0.5, 5)}
         if op == "ellipse":
-            return {"x_radius": float(self.rng.uniform(0.5, 5)),
-                    "y_radius": float(self.rng.uniform(0.5, 5))}
+            return {"x_radius": self._dim(0.5, 5),
+                    "y_radius": self._dim(0.5, 5)}
         if op == "polygon":
             return {"n_sides": int(self.rng.integers(3, 8)),
-                    "radius": float(self.rng.uniform(0.5, 5))}
+                    "radius": self._dim(0.5, 5)}
         if op == "slot":
-            return {"length": float(self.rng.uniform(2, 8)),
-                    "width": float(self.rng.uniform(0.5, 3))}
+            return {"length": self._dim(2, 8),
+                    "width": self._dim(0.5, 3)}
         if op in ("polyline", "spline"):
             # выпуклая оболочка случайных точек: контур без самопересечений,
             # поэтому extrude/revolve всегда дают корректное тело
             n = int(self.rng.integers(3, 6))
-            raw = [(float(self.rng.uniform(-4, 4)), float(self.rng.uniform(-4, 4)))
+            raw = [(self._dim(-4, 4), self._dim(-4, 4))
                    for _ in range(n)]
             cx = sum(p[0] for p in raw) / n
             cy = sum(p[1] for p in raw) / n
             pts = sorted(raw, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
             return {"points": pts}
         if op == "roundrect":
-            w = float(self.rng.uniform(2, 8))
-            h = float(self.rng.uniform(2, 8))
-            max_r = min(w, h) / 2.0 - 0.15
+            w = self._dim(2, 8)
+            h = self._dim(2, 8)
+            max_r = min(w, h) / 2.0 - 0.15 * self.scale
             return {"width": w, "height": h,
-                    "radius": float(self.rng.uniform(0.15, max(0.2, max_r)))}
+                    "radius": float(self.rng.uniform(0.15 * self.scale,
+                                                     max(0.2 * self.scale, max_r)))}
         if op == "frame":
             base = str(self.rng.choice(["rect", "circle", "ellipse", "polygon", "slot"]))
             outer = self._sketch_params(base)
             if base == "rect":
-                inset_max = max(0.1, min(outer["width"], outer["height"]) / 4.0)
-                inset = float(min(self.rng.uniform(0.05, 1.0) * inset_max, inset_max - 0.05))
-                inner = {"width": max(0.2, outer["width"] - 2 * inset),
-                         "height": max(0.2, outer["height"] - 2 * inset)}
+                inset_max = max(0.1 * self.scale,
+                                min(outer["width"], outer["height"]) / 4.0)
+                inset = float(min(self.rng.uniform(0.05, 1.0) * inset_max,
+                                  inset_max - 0.05 * self.scale))
+                inner = {"width": max(0.2 * self.scale, outer["width"] - 2 * inset),
+                         "height": max(0.2 * self.scale, outer["height"] - 2 * inset)}
             elif base == "circle":
-                inset = float(self.rng.uniform(0.1, outer["radius"] / 2.0))
-                inner = {"radius": max(0.15, outer["radius"] - inset)}
+                inset = float(self.rng.uniform(0.1 * self.scale, outer["radius"] / 2.0))
+                inner = {"radius": max(0.15 * self.scale, outer["radius"] - inset)}
             elif base == "ellipse":
-                inset = float(self.rng.uniform(0.1, min(outer["x_radius"], outer["y_radius"]) / 2.0))
-                inner = {"x_radius": max(0.15, outer["x_radius"] - inset),
-                         "y_radius": max(0.15, outer["y_radius"] - inset)}
+                inset = float(self.rng.uniform(0.1 * self.scale,
+                                               min(outer["x_radius"], outer["y_radius"]) / 2.0))
+                inner = {"x_radius": max(0.15 * self.scale, outer["x_radius"] - inset),
+                         "y_radius": max(0.15 * self.scale, outer["y_radius"] - inset)}
             elif base == "polygon":
-                inset = float(self.rng.uniform(0.1, outer["radius"] / 2.0))
+                inset = float(self.rng.uniform(0.1 * self.scale, outer["radius"] / 2.0))
                 inner = {"n_sides": outer["n_sides"],
-                         "radius": max(0.15, outer["radius"] - inset)}
+                         "radius": max(0.15 * self.scale, outer["radius"] - inset)}
             else:  # slot
-                inset = float(self.rng.uniform(0.1, min(outer["length"], outer["width"]) / 3.0))
-                inner = {"length": max(0.4, outer["length"] - 2 * inset),
-                         "width": max(0.15, outer["width"] - 2 * inset)}
+                inset = float(self.rng.uniform(0.1 * self.scale,
+                                               min(outer["length"], outer["width"]) / 3.0))
+                inner = {"length": max(0.4 * self.scale, outer["length"] - 2 * inset),
+                         "width": max(0.15 * self.scale, outer["width"] - 2 * inset)}
             return {"frame_op": base, "outer": outer, "inner": inner}
         if op == "sector":
             # угол <= 170 град: три точки дуги однозначны (минорная дуга) и OCCT
             # гарантированно строит revolution по такой дуге
-            return {"radius": float(self.rng.uniform(1.5, 5.0)),
+            return {"radius": self._dim(1.5, 5.0),
                     "angle": float(self.rng.uniform(30, 170))}
         if op == "arc_profile":
-            w = float(self.rng.uniform(2, 8))
-            h = float(self.rng.uniform(2, 8))
-            bow = float(self.rng.uniform(-1.5, 1.5))
-            if abs(bow) < 0.3:
-                bow = 0.3 if bow >= 0 else -0.3
+            w = self._dim(2, 8)
+            h = self._dim(2, 8)
+            bow = self._dim(-1.5, 1.5)
+            if abs(bow) < 0.3 * self.scale:
+                bow = 0.3 * self.scale if bow >= 0 else -0.3 * self.scale
             return {"width": w, "height": h, "bow": bow}
         if op == "ellipse_arc":
-            return {"x_radius": float(self.rng.uniform(1, 4)),
-                    "y_radius": float(self.rng.uniform(1, 4))}
+            return {"x_radius": self._dim(1, 4),
+                    "y_radius": self._dim(1, 4)}
         if op == "bent":
             shape = str(self.rng.choice(["L", "U"]))
-            a = float(self.rng.uniform(4, 9))
-            b = float(self.rng.uniform(2, 8))
-            t = float(self.rng.uniform(0.5, 2.0))
+            a = self._dim(4, 9)
+            b = self._dim(2, 8)
+            t = self._dim(0.5, 2.0)
             if shape == "L":
-                b = min(b, a - 1.0)
-                t = max(0.1, min(t, b - 0.1))
+                b = min(b, a - 1.0 * self.scale)
+                t = max(0.1 * self.scale, min(t, b - 0.1 * self.scale))
             else:  # U
-                t = max(0.1, min(t, min(a, b) / 2.0 - 0.05))
+                t = max(0.1 * self.scale, min(t, min(a, b) / 2.0 - 0.05 * self.scale))
             return {"shape": shape, "a": a, "b": b, "t": t}
         if op == "mirrored":
             n = int(self.rng.integers(2, 4))
-            x0 = float(self.rng.uniform(1.0, 2.0))
+            x0 = self._dim(1.0, 2.0)
             xs = [x0]
             x = x0
             for _ in range(n):
-                x += float(self.rng.uniform(0.6, 1.6))
+                x += self._dim(0.6, 1.6)
                 xs.append(x)
-            x1 = float(self.rng.uniform(x + 0.5, x + 2.0))
-            mids = [(xi, float(self.rng.uniform(0.5, 3.0))) for xi in xs[1:-1]]
+            x1 = float(self.rng.uniform(x + 0.5 * self.scale, x + 2.0 * self.scale))
+            mids = [(xi, self._dim(0.5, 3.0)) for xi in xs[1:-1]]
             return {"points": [(xs[0], 0.0)] + mids + [(x1, 0.0)]}
         raise GenerationError(f"Unknown sketch op {op}")
 
@@ -1005,7 +1076,7 @@ class ASTBuilder:
         offsets = [0.0]
         z = 0.0
         for _ in range(1, n_profiles):
-            z += float(self.rng.uniform(3, 12))
+            z += self._dim(3, 12)
             offsets.append(z)
         return offsets
 
@@ -1015,18 +1086,18 @@ class ASTBuilder:
         pts = [(0.0, 0.0, 0.0)]
         x = 0.0
         for _ in range(1, n):
-            x += float(self.rng.uniform(2, 5))
-            y = float(self.rng.uniform(-2, 2))
-            z = float(self.rng.uniform(-2, 2))
+            x += self._dim(2, 5)
+            y = self._dim(-2, 2)
+            z = self._dim(-2, 2)
             pts.append((x, y, z))
         return PathNode(operation="path",
                         parameters={"points": pts, "method": method, "workplane": "XY"})
 
     def _extrude_params(self) -> Dict[str, Any]:
-        return {"distance": float(self.rng.uniform(0.5, 15))}
+        return {"distance": self._dim(0.5, 15)}
 
     def _twist_extrude_params(self) -> Dict[str, Any]:
-        return {"distance": float(self.rng.uniform(0.5, 12)),
+        return {"distance": self._dim(0.5, 12),
                 "angle": float(self.rng.uniform(5, 60))}
 
     # ------------------------------------------------------------------ #
@@ -1034,9 +1105,9 @@ class ASTBuilder:
     # ------------------------------------------------------------------ #
     def _transform_params(self, op: str) -> Dict[str, Any]:
         if op == "translate":
-            return {"vector": (float(self.rng.uniform(-15, 15)),
-                               float(self.rng.uniform(-15, 15)),
-                               float(self.rng.uniform(-15, 15)))}
+            return {"vector": (self._dim(-15, 15),
+                               self._dim(-15, 15),
+                               self._dim(-15, 15))}
         if op == "rotate":
             return {"axis": str(self.rng.choice(["X", "Y", "Z"])),
                     "angle": float(self.rng.uniform(15, 345))}

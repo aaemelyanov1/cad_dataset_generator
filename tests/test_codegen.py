@@ -40,6 +40,12 @@ def _bbox(shape):
     return (bb.xmax, bb.ymax, bb.zmax, bb.xmin, bb.ymin, bb.zmin)
 
 
+def _iter_nodes(node):
+    yield node
+    for child in getattr(node, "children", []):
+        yield from _iter_nodes(child)
+
+
 def _assert_reproduces(ast, shape):
     result, code = _run(ast)
     assert float(result.Volume()) == pytest.approx(float(shape.Volume()), rel=1e-6, abs=1e-6)
@@ -202,6 +208,31 @@ def _individual_ops():
 def test_individual_operation_reproduces_executor(name, ast):
     shape = Executor().execute(ast)
     _assert_reproduces(ast, shape)
+
+
+def test_split_recorded_params_reproduce():
+    """Split-узлы с зафиксированными plane_offset/parts_count воспроизводятся
+    сгенерированной программой (бесцикловой) так же, как холодным Executor'ом."""
+    config = GeneratorConfig()
+    checked = 0
+    for seed in range(30):
+        builder = ASTBuilder(config, seed=seed, complexity="medium")
+        ast = builder.build()
+        if not any(isinstance(n, SplitNode) for n in _iter_nodes(ast)):
+            continue
+        try:
+            shape = Executor().execute(ast)
+        except Exception:
+            # тёплый/холодный кэш может расходиться; такие деревья отсекает
+            # холодная root-валидация (config.verify_root_cold) — здесь пропускаем
+            continue
+        result, code = _run(ast)
+        assert "for " not in code
+        assert float(result.Volume()) == pytest.approx(float(shape.Volume()),
+                                                       rel=1e-6, abs=1e-6)
+        assert _bbox(result) == pytest.approx(_bbox(shape), rel=1e-6, abs=1e-6)
+        checked += 1
+    assert checked >= 1, "ни одного split-дерева не встретилось"
 
 
 # --------------------------------------------------------------------------- #

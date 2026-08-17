@@ -90,7 +90,9 @@ class Executor:
                         csk_radius=p.get("csk_radius"), csk_depth=p.get("csk_depth"))
         if isinstance(node, SplitNode):
             child = self.execute(node.children[0])
-            return split(child, node.parameters["axis"], node.parameters["gap"])
+            return split(child, node.parameters["axis"], node.parameters["gap"],
+                         plane_offset=node.parameters.get("plane_offset"),
+                         parts_count=node.parameters.get("parts_count"))
         if isinstance(node, TransformNode):
             child = self.execute(node.children[0])
             op = node.operation

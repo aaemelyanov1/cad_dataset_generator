@@ -139,6 +139,12 @@ class DatasetBuilder:
         идентичные программы. Работает во всех режимах вывода (только программы,
         плоский `--flat`, полный с экспортами): сложность, имена файлов
         `sample_{index:05d}*` и таймауты привязаны к абсолютному индексу.
+
+        Индексы обрабатываются **окнами** ~`4×workers`: зависший или падающий
+        сэмпл переделывает только своё окно (перезапуск/повтор по прежней схеме),
+        а не переотправляет весь оставшийся хвост. Каждое окно — свой
+        `multiprocessing.Pool`. Семантика seed-ретраев и `max_seed_retries`
+        сохраняется; на выходе датасет идентичен «окну = всему хвосту».
         """
         if num_samples <= 0:
             logger.warning("num_samples=%d: nothing to generate", num_samples)
@@ -154,6 +160,7 @@ class DatasetBuilder:
             # 8 параллельных OCCT-процессов достаточно, чтобы насытить CPU;
             # массовый spawn десятков процессов на Windows может сбоить (WinError 87)
             workers = max(1, min(os.cpu_count() or 1, 8, num_samples))
+        window_size = max(4, 4 * workers)
         retries_left = {i: self.config.max_seed_retries for i in indices}
         pending: dict = {i: int(base_seeds[i]) for i in indices}
         logger.info("Generating %d samples starting from index %d "
@@ -161,17 +168,21 @@ class DatasetBuilder:
                     self.config.global_seed)
 
         while pending:
+            # окно не длиннее 4×workers: крупная авария переделается локально
+            _items = list(pending.items())
+            window: dict = dict(_items[:window_size])
+            rest: dict = dict(_items[window_size:])
             pool = None
             for _ in range(3):
                 try:
-                    pool = mp.Pool(processes=min(workers, len(pending)))
+                    pool = mp.Pool(processes=min(workers, len(window)))
                     break
                 except OSError:
                     time.sleep(1.0)
             if pool is None:
                 raise RuntimeError("failed to create multiprocessing pool")
             futures = {i: pool.apply_async(self.generate_sample, (i, seed))
-                       for i, seed in pending.items()}
+                       for i, seed in window.items()}
             pool.close()
 
             next_pending: dict = {}
@@ -187,7 +198,7 @@ class DatasetBuilder:
                     logger.error(f"Sample {idx} failed after "
                                  f"{self.config.max_seed_retries} seed retries")
                 else:
-                    prev = pending[idx]
+                    prev = window[idx]
                     next_pending[idx] = prev + 1
 
             for i in list(futures):
@@ -232,7 +243,7 @@ class DatasetBuilder:
                     settle(j, ok)
                 retries_left[hung] -= 1
                 if retries_left[hung] > 0:
-                    next_pending[hung] = pending[hung] + 1
+                    next_pending[hung] = window[hung] + 1
             # сэмплы, чья работа оборвана terminate() до завершения, запускаем
             # заново с тем же seed; такой перезапуск тоже тратит retry, чтобы
             # цикл всегда сходился (нельзя вечно перезапускать «медленных»)
@@ -241,7 +252,7 @@ class DatasetBuilder:
                     continue
                 retries_left[j] -= 1
                 if retries_left[j] > 0:
-                    next_pending.setdefault(j, pending[j])
+                    next_pending.setdefault(j, window[j])
                 else:
                     logger.error(f"Sample {j} repeatedly killed by timeouts after "
                                  f"{self.config.max_seed_retries} attempts")
@@ -249,4 +260,5 @@ class DatasetBuilder:
             pool.terminate()
             pool.join()
             pending = next_pending
+            pending.update(rest)
         logger.info("Dataset generation finished.")
